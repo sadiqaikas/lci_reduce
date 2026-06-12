@@ -45,6 +45,7 @@ def write_pdf_report(
         f"Empty selected LCIA categories: {validation.get('n_empty_lcia_categories', 0)}",
         f"Uncharacterised policy: {config.uncharacterised_policy}",
         f"Strict units: {config.strict_units}",
+        f"Water mass/volume override: {config.allow_water_mass_volume_override}",
     ]
     story.extend(_paragraphs(input_lines, body))
 
@@ -79,9 +80,6 @@ def write_pdf_report(
         f"CF ambiguities found: {validation.get('n_cf_ambiguities_found', 0)}",
         f"Unique CF ambiguity keys: {validation.get('n_cf_ambiguity_keys_unique', 0)}",
         f"CF ambiguities resolved automatically: {validation.get('n_cf_ambiguities_resolved_automatically', 0)}",
-        f"Unique user decisions: {validation.get('n_cf_unique_user_decisions', 0)}",
-        f"User-decision applications: {validation.get('n_cf_user_decision_applications', 0)}",
-        f"User-decision reuses: {validation.get('n_cf_resolution_choices_reused', 0)}",
         f"CF ambiguities unresolved: {validation.get('n_cf_ambiguities_unresolved', 0)}",
         f"CF ambiguity failures: {validation.get('n_cf_ambiguity_failures', 0)}",
         f"CF unit conflicts: {validation.get('n_cf_unit_conflicts', 0)}",
@@ -132,7 +130,6 @@ def write_pdf_report(
         f"Validation JSON: {output_files['validation_report']}",
         f"Warnings CSV: {output_files['warnings_csv']}",
         f"CF ambiguities CSV: {output_files.get('cf_ambiguities_csv') or 'Not created'}",
-        f"CF resolution choices CSV: {output_files.get('cf_resolution_choices_csv') or 'Not created'}",
     ]
     story.extend(_paragraphs(output_lines, body))
     doc.build(story)

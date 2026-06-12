@@ -2,7 +2,7 @@ import json
 import zipfile
 from pathlib import Path
 
-from lci_reduce.jsonld_reader import load_archive
+from lci_reduce.archive_reader import load_archive
 
 
 def test_methods_archive_can_be_methods_only(tmp_path: Path):

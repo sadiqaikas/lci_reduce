@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
+from tempfile import gettempdir
+
+_MPLCONFIGDIR = Path(os.environ.get("MPLCONFIGDIR") or (Path(gettempdir()) / "lci_reduce_mplconfig"))
+_MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIGDIR))
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -845,6 +851,11 @@ class PriorityAnalyserPanel(QWidget):
         tau_text = ", ".join(pair.tau_label for pair in dataset.tau_pairs)
         self.load_status_label.setText(
             f"Loaded {Path(dataset.source_path).name} | tau: {tau_text} | flows: {overview['total_flows']:,}"
+            + (
+                " | legacy cf_status detected"
+                if dataset.has_cf_status_column
+                else " | cf_status derived from occurrence counts"
+            )
         )
         self.selected_count_label.setText("Selected flows: 0")
 
@@ -894,7 +905,7 @@ class PriorityAnalyserPanel(QWidget):
             ]
         cf_status = str(self.top_cf_status_combo.currentData())
         if cf_status != "all":
-            rows = [row for row in rows if row.cf_status == cf_status]
+            rows = [row for row in rows if row.effective_cf_status == cf_status]
         if self.top_eta_positive_checkbox.isChecked():
             rows = [row for row in rows if row.eta(pair) > _EPSILON]
         if self.top_loss_positive_checkbox.isChecked():
@@ -952,7 +963,7 @@ class PriorityAnalyserPanel(QWidget):
                 self._set_text_item(self.top_table, row_index, 3, _format_metric(row.eta(pair)), numeric=True)
                 self._set_text_item(self.top_table, row_index, 4, _format_metric(row.loss_max(pair)), numeric=True)
                 self._set_text_item(self.top_table, row_index, 5, _format_metric(row.tau_entry_min), numeric=True)
-                self._set_text_item(self.top_table, row_index, 6, row.cf_status)
+                self._set_text_item(self.top_table, row_index, 6, row.display_cf_status)
         finally:
             self.top_table.setUpdatesEnabled(True)
             self._updating_tables = False
@@ -975,7 +986,7 @@ class PriorityAnalyserPanel(QWidget):
                     f"Compartment: {row.compartment or '-'}",
                     f"Subcompartment: {row.subcompartment or '-'}",
                     f"Reference unit: {row.reference_unit or '-'}",
-                    f"cf_status: {row.cf_status}",
+                    f"cf_status: {row.display_cf_status}",
                     f"Occurrences: {_format_int(row.occurrence_count)}",
                     f"Characterised occurrences: {_format_int(row.characterised_occurrence_count)}",
                     "",
@@ -1066,7 +1077,7 @@ class PriorityAnalyserPanel(QWidget):
             return rank_rows_by_loss_max(rows, current_pair), (
                 f"{len(rows):,} flows are group-risk-only at audit tau {current_pair.tau_label}."
             )
-        rows = [row for row in self.dataset.rows if row.cf_status == "uncharacterised"]
+        rows = [row for row in self.dataset.rows if row.is_uncharacterised]
         return rows, f"{len(rows):,} flows are uncharacterised."
 
     def _render_risk_table(self, current_pair: TauColumnPair) -> None:
@@ -1095,7 +1106,7 @@ class PriorityAnalyserPanel(QWidget):
                     numeric=True,
                 )
                 self._set_text_item(self.risk_table, row_index, 5, _format_metric(row.loss_max(current_pair)), numeric=True)
-                self._set_text_item(self.risk_table, row_index, 6, row.cf_status)
+                self._set_text_item(self.risk_table, row_index, 6, row.display_cf_status)
         finally:
             self.risk_table.setUpdatesEnabled(True)
             self._updating_tables = False
@@ -1111,7 +1122,10 @@ class PriorityAnalyserPanel(QWidget):
             tau_label = current_pair.tau_label if current_pair is not None else "selected tau"
             text = f"Group-risk-only: eta_{tau_label} = 0 and loss_max_{tau_label} > 0"
         else:
-            text = "Not visible to selected LCIA methods: cf_status = uncharacterised"
+            if self.dataset is not None and not self.dataset.has_cf_status_column:
+                text = "Not visible to selected LCIA methods: characterised_occurrence_count = 0"
+            else:
+                text = "Not visible to selected LCIA methods: cf_status = uncharacterised"
         self.risk_definition_label.setText(text)
 
     def refresh_core_tail_tables(self) -> None:
@@ -1468,9 +1482,11 @@ class PriorityAnalyserPanel(QWidget):
                     "Bound used from the compact priority CSV",
                     f"Lower bound = max eta_f({result.pair.tau_label}) = {_format_metric(result.lower_bound)}",
                     (
-                        f"Upper bound = min({result.pair.tau_label}, sum loss_max_f({result.pair.tau_label})) = "
+                        f"Upper bound = min({result.pair.tau_label}, min_f [eta_f({result.pair.tau_label}) + "
+                        f"sum_(g!=f) loss_max_g({result.pair.tau_label})]) = "
                         f"{_format_metric(result.upper_bound)}"
                     ),
+                    f"Sum loss_max_f({result.pair.tau_label}) = {_format_metric(result.sum_loss_max)} (looser reference bound)",
                 ]
             )
         lines.extend(["", "Interpretation"])
@@ -1507,7 +1523,10 @@ class PriorityAnalyserPanel(QWidget):
         tau_label = result.pair.tau_label
         lines = [
             "Selected-flow consequence",
-            f"max eta_f({tau_label}) <= eta_F({tau_label}) <= min({tau_label}, sum loss_max_f({tau_label}))",
+            (
+                f"max eta_f({tau_label}) <= eta_F({tau_label}) <= "
+                f"min({tau_label}, min_f [eta_f({tau_label}) + sum_(g!=f) loss_max_g({tau_label})])"
+            ),
             "",
         ]
         if result.exact_eta is not None:
@@ -1518,8 +1537,11 @@ class PriorityAnalyserPanel(QWidget):
             lines.extend(
                 [
                     f"Lower bound = max eta_f({tau_label}) = {_format_metric(result.lower_bound)}",
-                    f"Upper bound = min({tau_label}, sum loss_max_f({tau_label})) = {_format_metric(result.upper_bound)}",
-                    f"Sum loss_max_f({tau_label}) = {_format_metric(result.sum_loss_max)}",
+                    (
+                        f"Upper bound = min({tau_label}, min_f [eta_f({tau_label}) + "
+                        f"sum_(g!=f) loss_max_g({tau_label})]) = {_format_metric(result.upper_bound)}"
+                    ),
+                    f"Sum loss_max_f({tau_label}) = {_format_metric(result.sum_loss_max)} (looser reference bound)",
                     "",
                     "This selection is not exactly identifiable from the compact CSV, so the interval is shown.",
                 ]

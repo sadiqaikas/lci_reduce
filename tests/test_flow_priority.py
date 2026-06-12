@@ -10,6 +10,9 @@ import numpy as np
 import pytest
 
 from lci_reduce.cli import priority_command
+from lci_reduce.contribution import build_sparse_contribution_details
+from lci_reduce.archive_reader import index_archive, merge_unit_registries, read_json_object
+from lci_reduce.lcia import collect_categories, resolve_lcia_archives, select_lcia_categories
 from lci_reduce.flow_priority import build_greedy_ladder, prefix_length_for_tau, single_flow_shortfall
 
 
@@ -372,6 +375,62 @@ def make_priority_zero_cf_database_zip(base: Path, name: str = "priority_zero_cf
     )
 
 
+def make_priority_missing_category_database_zip(base: Path, name: str = "priority_missing_category_db.zip") -> Path:
+    return _write_archive(
+        base / name,
+        {
+            "processes/process-1.json": {
+                "@id": "process-1",
+                "@type": "Process",
+                "name": "Missing Category Process",
+                "exchanges": [
+                    {
+                        "@id": "product",
+                        "amount": 1.0,
+                        "flow": {"@id": "flow-product", "name": "Product"},
+                        "unit": {"name": "kg"},
+                        "quantitativeReference": True,
+                    },
+                    {
+                        "@id": "elem-1",
+                        "amount": 2.0,
+                        "flow": {"@id": "flow-missing-category", "name": "Missing category flow"},
+                        "unit": {"name": "kg"},
+                    },
+                ],
+            },
+            "flows/flow-product.json": {
+                "@id": "flow-product",
+                "@type": "Flow",
+                "name": "Product",
+                "flowType": "PRODUCT_FLOW",
+                "categoryPath": "products",
+            },
+            "flows/flow-missing-category.json": {
+                "@id": "flow-missing-category",
+                "@type": "Flow",
+                "name": "Missing category flow",
+                "flowType": "ELEMENTARY_FLOW",
+            },
+            "lcia_methods/method-1.json": {
+                "@id": "method-1",
+                "@type": "ImpactMethod",
+                "name": "Missing Category Method",
+            },
+            "lcia_categories/category-1.json": {
+                "@id": "category-1",
+                "@type": "ImpactCategory",
+                "name": "Climate change",
+                "impactMethod": {"@id": "method-1", "name": "Missing Category Method"},
+                "referenceUnitName": "kg",
+                "impactFactors": [
+                    {"flow": {"@id": "flow-missing-category", "name": "Missing category flow"}, "value": 1.0, "unitName": "kg"},
+                ],
+            },
+        },
+    )
+
+
 def _read_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -452,6 +511,28 @@ def test_ladder_order_is_invariant_to_category_rescaling() -> None:
     assert scaled_ladder.order == [0, 1, 2]
 
 
+def test_sparse_contribution_details_can_skip_resolved_mask_for_priority_memory(tmp_path: Path) -> None:
+    db_zip = make_priority_database_zip(tmp_path)
+    archive = index_archive(str(db_zip), require_processes=True, require_flows=True)
+    archives, _source, _ignored = resolve_lcia_archives(archive, None)
+    categories = list(select_lcia_categories(collect_categories(archives), "all"))
+    process_locator = next(iter(archive.processes.values()))
+    process_data = read_json_object(str(db_zip), process_locator.path)
+    details = build_sparse_contribution_details(
+        exchanges=list(process_data.get("exchanges") or []),
+        flow_lookup=archive.flows,
+        categories=categories,
+        unit_registry=merge_unit_registries(getattr(archive, "units", {}), {}),
+        strict_units=True,
+        tol=1e-12,
+        process_data=process_data,
+        include_resolved_mask=False,
+    )
+
+    assert details.resolved_mask.shape == (0, 0)
+    assert list(details.characterised_flags) == [True, False]
+
+
 def test_ladder_prefers_fractional_gain_over_raw_magnitude() -> None:
     matrix = np.array(
         [
@@ -481,10 +562,9 @@ def test_uncharacterised_flow_has_zero_priority_metrics(tmp_path: Path) -> None:
     )
 
     header, rows = _read_csv_rows(Path(result.flow_priority_csv))
-    assert header[-1] == "cf_status"
+    assert "cf_status" not in header
     row_lookup = {row["flow_id"]: row for row in rows}
     unmapped = row_lookup["flow-unk"]
-    assert unmapped["cf_status"] == "uncharacterised"
     assert unmapped["characterised_occurrence_count"] == "0"
     assert unmapped["eta_0_95"] == "0"
     assert unmapped["loss_max_0_95"] == "0"
@@ -540,6 +620,36 @@ def test_priority_output_resolves_flow_category_references_to_compartments(tmp_p
     assert row_lookup["flow-co2"]["subcompartment"] == "urban air"
 
 
+def test_priority_metadata_reports_unresolved_flow_category_paths(tmp_path: Path) -> None:
+    db_zip = make_priority_missing_category_database_zip(tmp_path)
+    output_dir = tmp_path / "priority_missing_category_out"
+    result = priority_command(
+        database=str(db_zip),
+        methods=None,
+        output=str(output_dir),
+        method_selection="all",
+        audit_tau=[0.95, 0.99],
+        strict_units=True,
+        tolerance=1e-12,
+    )
+
+    _header, rows = _read_csv_rows(Path(result.flow_priority_csv))
+    row_lookup = {row["flow_id"]: row for row in rows}
+    assert row_lookup["flow-missing-category"]["compartment"] == ""
+    assert row_lookup["flow-missing-category"]["subcompartment"] == ""
+
+    metadata = json.loads(Path(result.flow_priority_metadata_json).read_text(encoding="utf-8"))
+    diagnostics = metadata["flow_category_path_diagnostics"]
+    assert diagnostics["n_category_objects_indexed"] == 0
+    assert diagnostics["n_elementary_flows"] == 1
+    assert diagnostics["n_elementary_flows_with_category_path"] == 0
+    assert diagnostics["n_unresolved_elementary_flows"] == 1
+    assert diagnostics["pct_elementary_flows_with_category_path"] == 0.0
+    assert diagnostics["sample_unresolved_elementary_flows"][0]["flow_id"] == "flow-missing-category"
+    assert diagnostics["sample_unresolved_elementary_flows"][0]["category"] is None
+    assert "flow_category_path_diagnostics" in metadata["warnings"][0]["message"]
+
+
 def test_default_csv_schema_is_exact(tmp_path: Path) -> None:
     db_zip = make_priority_database_zip(tmp_path)
     output_dir = tmp_path / "schema_out"
@@ -570,7 +680,6 @@ def test_default_csv_schema_is_exact(tmp_path: Path) -> None:
         "eta_0_99",
         "eta_0_99_witness",
         "loss_max_0_99",
-        "cf_status",
     ]
 
 
@@ -666,6 +775,9 @@ def test_priority_run_does_not_rewrite_database_or_create_lite_zip(tmp_path: Pat
 
     assert Path(result.flow_priority_csv).exists()
     assert Path(result.flow_priority_metadata_json).exists()
+    assert not Path(output_dir / "priority_checkpoint.json").exists()
+    assert not Path(output_dir / "warnings.csv").exists()
+    assert not Path(output_dir / "cf_ambiguities.csv").exists()
     assert list(output_dir.glob("*.zip")) == []
     assert db_zip.read_bytes() == original_bytes
 
@@ -773,4 +885,8 @@ def test_priority_cli_writes_sidecars_only(tmp_path: Path) -> None:
     payload = json.loads(result.stdout)
     assert Path(payload["flow_priority_csv"]).exists()
     assert Path(payload["flow_priority_metadata_json"]).exists()
+    assert "priority_checkpoint_json" not in payload
+    assert not Path(output_dir / "priority_checkpoint.json").exists()
+    assert not Path(output_dir / "warnings.csv").exists()
+    assert not Path(output_dir / "cf_ambiguities.csv").exists()
     assert list(output_dir.glob("*.zip")) == []

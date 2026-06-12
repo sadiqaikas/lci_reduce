@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import statistics
 import time
+from array import array
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 import numpy as np
 
 from . import __version__
-from .cf_resolution import CFResolutionManager, PromptCallback
-from .contribution import build_contribution_details, exchange_flow_id, exchange_unit_name, flow_compartment
-from .jsonld_reader import index_archive, iter_source_entries, parse_json_object
+from .cf_resolution import CFResolutionManager
+from .contribution import build_sparse_contribution_details, exchange_flow_id, exchange_unit_name, flow_compartment
+from .ecospold1_reader import iter_ecospold_processes
+from .errors import DataFormatError
+from .archive_reader import index_archive, iter_source_entries, merge_unit_registries, parse_json_object
 from .lcia import (
     collect_categories,
     ensure_category_factor_quality,
@@ -27,6 +31,7 @@ from .lcia import (
 from .manifest import write_manifest_csv
 from .models import (
     CFAmbiguityRecord,
+    CoverageRowMetadata,
     CreateProgressUpdate,
     FlowInfo,
     FlowPriorityConfig,
@@ -34,6 +39,12 @@ from .models import (
     ImpactCategory,
     UnitInfo,
     WarningRecord,
+)
+from .sparse_cover import (
+    add_column_contribution,
+    build_greedy_ladder_sparse,
+    build_sparse_cover_matrix,
+    column_nonzero_mask,
 )
 
 
@@ -52,6 +63,8 @@ _BASE_COLUMNS = [
     "tau_entry_max",
 ]
 
+_METADATA_RECORD_SAMPLE_LIMIT = 100
+
 
 @dataclass
 class GreedyLadder:
@@ -68,11 +81,34 @@ class _FlowAggregate:
     reference_unit: str = ""
     occurrence_count: int = 0
     characterised_occurrence_count: int = 0
-    tau_entries: List[float] = field(default_factory=list)
-    resolved_categories: set[str] = field(default_factory=set)
+    tau_entries: array = field(default_factory=lambda: array("d"))
     loss_max_by_tau: Dict[float, float] = field(default_factory=dict)
     eta_by_tau: Dict[float, float] = field(default_factory=dict)
     eta_witness_by_tau: Dict[float, str] = field(default_factory=dict)
+
+
+class _BoundedRecordSink:
+    """Count records while keeping only a small in-memory metadata sample."""
+
+    def __init__(self, *, sample_limit: int = _METADATA_RECORD_SAMPLE_LIMIT) -> None:
+        self.count = 0
+        self._sample_limit = sample_limit
+        self._sample: list[Any] = []
+
+    def append(self, record: Any) -> None:
+        self.count += 1
+        if len(self._sample) < self._sample_limit:
+            self._sample.append(record)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._sample)
+
+    @property
+    def sample(self) -> list[Any]:
+        return list(self._sample)
 
 
 def _emit_progress(
@@ -205,10 +241,90 @@ def _display_label(name: str | None, object_id: str | None) -> str:
     return "-"
 
 
-def _eta_witness(process_name: str | None, process_id: str | None, category: ImpactCategory, sign: str) -> str:
+def _archive_parse_warnings(archive: object | None) -> list[dict[str, str]]:
+    if archive is None:
+        return []
+    extra = getattr(archive, "extra", {})
+    if not isinstance(extra, dict):
+        return []
+    raw_warnings = extra.get("parse_warnings", [])
+    warnings: list[dict[str, str]] = []
+    if not isinstance(raw_warnings, list):
+        return warnings
+    for item in raw_warnings:
+        if not isinstance(item, dict):
+            continue
+        source_file = str(item.get("source_file") or "").strip()
+        message = str(item.get("message") or "").strip()
+        error_type = str(item.get("error_type") or "").strip()
+        if not source_file or not message:
+            continue
+        warnings.append(
+            {
+                "source_file": source_file,
+                "message": message,
+                "error_type": error_type,
+            }
+        )
+    return warnings
+
+
+def _parse_warning_record(
+    *,
+    source_name: str,
+    source_file: str,
+    message: str,
+    input_role: str,
+) -> WarningRecord:
+    return WarningRecord(
+        severity="warning",
+        object_type="input_archive",
+        object_id=source_name,
+        object_name=source_name,
+        process_id="",
+        process_name="",
+        flow_id="",
+        flow_name="",
+        category_id="",
+        category_name="",
+        message=f"Skipped malformed EcoSpold1 XML file in {input_role}: {source_file}. {message}",
+        source_file=source_file,
+    )
+
+
+def _raise_if_no_selected_categories(
+    *,
+    selected_categories: Sequence[ImpactCategory],
+    methods_input: str | None,
+    input_parse_warnings: Sequence[dict[str, str]],
+) -> None:
+    if selected_categories:
+        return
+    message = "No usable LCIA categories were available for this priority run."
+    if methods_input:
+        message += " The external methods input did not provide any parseable impact categories."
+    if input_parse_warnings:
+        first_warning = input_parse_warnings[0]
+        message += (
+            f" {len(input_parse_warnings)} input XML file(s) were skipped due to parse errors. "
+            f"First skipped file: {first_warning['source_file']}. "
+            f"First error: {first_warning['message']}"
+        )
+    raise DataFormatError(message)
+
+
+def _eta_witness(
+    process_name: str | None,
+    process_id: str | None,
+    row_metadata: CoverageRowMetadata,
+    sign: str,
+) -> str:
     process_label = _display_label(process_name, process_id)
-    category_label = _display_label(category.name, category.category_id)
-    return f"{process_label} | {category_label} | {sign}"
+    category_label = _display_label(row_metadata.category_name, row_metadata.category_id)
+    if row_metadata.scenario_type == "exact":
+        return f"{process_label} | {category_label} | {sign}"
+    scenario_label = row_metadata.scenario_label or row_metadata.scenario_id or "scenario"
+    return f"{process_label} | {category_label} | {scenario_label} | {sign}"
 
 
 def build_greedy_ladder(
@@ -229,7 +345,7 @@ def build_greedy_ladder(
         raise ValueError("exchange_keys length must match number of exchanges")
     entry_thresholds = np.full(n_exchanges, np.nan, dtype=float)
     full = array.sum(axis=1)
-    active = full > 0.0
+    active = full > tol
     if n_categories == 0 or n_exchanges == 0 or not active.any():
         return GreedyLadder(order=[], entry_thresholds=entry_thresholds, lambda_after=np.zeros(0), full=full, active=active)
     weights = np.zeros(n_categories, dtype=float)
@@ -320,13 +436,6 @@ def _selected_methods(categories: Sequence[ImpactCategory]) -> List[dict]:
     return rows
 
 
-def _choice_history_hash(resolution_manager: CFResolutionManager) -> str:
-    if not resolution_manager.choice_history:
-        return ""
-    payload = json.dumps([record.__dict__ for record in resolution_manager.choice_history], ensure_ascii=True, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 def _process_progress_message(process_index: int, process_total: int, process_name: str) -> str:
     label = process_name or "-"
     return f"Step 5/6: Process {process_index}/{process_total} | {label}"
@@ -359,7 +468,7 @@ def _update_flow_metrics_for_sign(
     matrix: np.ndarray,
     ladder: GreedyLadder,
     flow_ids: Sequence[str],
-    categories: Sequence[ImpactCategory],
+    row_metadata: Sequence[CoverageRowMetadata],
     audit_tau_values: Sequence[float],
     aggregates: Dict[str, _FlowAggregate],
     tol: float,
@@ -400,7 +509,55 @@ def _update_flow_metrics_for_sign(
                 aggregates[flow_id].eta_witness_by_tau[tau] = _eta_witness(
                     process_name,
                     process_id,
-                    categories[witness_index],
+                    row_metadata[witness_index],
+                    sign,
+                )
+
+
+def _update_flow_metrics_for_sign_sparse(
+    model: Any,
+    ladder: GreedyLadder,
+    flow_ids: Sequence[str],
+    audit_tau_values: Sequence[float],
+    aggregates: Dict[str, _FlowAggregate],
+    tol: float,
+    *,
+    process_name: str,
+    process_id: str,
+    sign: str,
+) -> None:
+    if not ladder.active.any() or not ladder.order:
+        return
+    retained = np.zeros(model.n_rows, dtype=float)
+    selected_columns_by_flow: Dict[str, List[int]] = {}
+    cursor = 0
+    active_indices = np.flatnonzero(ladder.active)
+    full_active = ladder.full[ladder.active]
+    for tau in audit_tau_values:
+        target = prefix_length_for_tau(ladder, tau, tol=tol)
+        while cursor < target:
+            local_index = ladder.order[cursor]
+            add_column_contribution(model, retained, local_index)
+            selected_columns_by_flow.setdefault(flow_ids[local_index], []).append(local_index)
+            cursor += 1
+        coverage_active = retained[ladder.active] / full_active
+        for flow_id, selected_columns in selected_columns_by_flow.items():
+            flow_vector = np.zeros(model.n_rows, dtype=float)
+            for local_index in selected_columns:
+                add_column_contribution(model, flow_vector, local_index)
+            flow_active = flow_vector[ladder.active] / full_active
+            loss_max = float(flow_active.max(initial=0.0))
+            if loss_max > aggregates[flow_id].loss_max_by_tau[tau]:
+                aggregates[flow_id].loss_max_by_tau[tau] = loss_max
+            shortfalls_active = np.maximum(tau - (coverage_active - flow_active), 0.0)
+            shortfall = float(shortfalls_active.max(initial=0.0))
+            if shortfall > aggregates[flow_id].eta_by_tau[tau]:
+                aggregates[flow_id].eta_by_tau[tau] = shortfall
+                witness_index = int(active_indices[np.argmax(shortfalls_active)])
+                aggregates[flow_id].eta_witness_by_tau[tau] = _eta_witness(
+                    process_name,
+                    process_id,
+                    model.row_metadata[witness_index],
                     sign,
                 )
 
@@ -408,16 +565,9 @@ def _update_flow_metrics_for_sign(
 def _csv_row(
     aggregate: _FlowAggregate,
     audit_tau_values: Sequence[float],
-    selected_category_ids: set[str],
 ) -> dict:
     tau_entries = aggregate.tau_entries
     compartment, subcompartment = flow_compartment(aggregate.flow)
-    if not aggregate.resolved_categories:
-        cf_status = "uncharacterised"
-    elif aggregate.characterised_occurrence_count > 0 and aggregate.resolved_categories >= selected_category_ids:
-        cf_status = "characterised"
-    else:
-        cf_status = "partly_characterised"
     row = {
         "flow_id": aggregate.flow.flow_id,
         "flow_name": aggregate.flow.name,
@@ -435,14 +585,44 @@ def _csv_row(
         row[f"eta_{suffix}"] = _format_float(aggregate.eta_by_tau[tau])
         row[f"eta_{suffix}_witness"] = aggregate.eta_witness_by_tau.get(tau, "") if aggregate.eta_by_tau[tau] > 0.0 else ""
         row[f"loss_max_{suffix}"] = _format_float(aggregate.loss_max_by_tau[tau])
-    row["cf_status"] = cf_status
     return row
+
+
+def _category_path_warning(
+    database_name: str,
+    metadata_name: str,
+    diagnostics: Any,
+    *,
+    source_format: str = "jsonld",
+) -> WarningRecord | None:
+    if diagnostics.n_unresolved_elementary_flows <= 0:
+        return None
+    source_label = "JSON-LD category resolution" if source_format == "jsonld" else "source-format flow parsing"
+    return WarningRecord(
+        severity="warning",
+        object_type="database",
+        object_id=database_name,
+        object_name=database_name,
+        process_id="",
+        process_name="",
+        flow_id="",
+        flow_name="",
+        category_id="",
+        category_name="",
+        message=(
+            f"{diagnostics.n_unresolved_elementary_flows}/{diagnostics.n_elementary_flows} elementary flows "
+            f"({format(diagnostics.pct_elementary_flows_with_category_path, '.2f')}% with category paths) "
+            f"still have empty flow category paths after {source_label}. "
+            "Their `compartment` and `subcompartment` CSV fields remain blank. "
+            f"See `flow_category_path_diagnostics` in {metadata_name}."
+        ),
+        source_file=metadata_name,
+    )
 
 
 def create_flow_priority(
     config: FlowPriorityConfig,
     *,
-    cf_prompt: Optional[PromptCallback] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> FlowPriorityResult:
     audit_tau_values = _normalise_tau_values(config.audit_tau_values)
@@ -450,16 +630,12 @@ def create_flow_priority(
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "lcia_flow_priority.csv"
     metadata_path = output_dir / "lcia_flow_priority_metadata.json"
-    warnings: List[WarningRecord] = []
-    cf_ambiguities: List[CFAmbiguityRecord] = []
+    warnings = _BoundedRecordSink()
+    cf_ambiguities = _BoundedRecordSink()
     selected_categories: List[ImpactCategory] = []
     empty_selected_categories: List[ImpactCategory] = []
     flow_aggregates: Dict[str, _FlowAggregate] = {}
-    resolution_manager = CFResolutionManager(
-        mode="gui" if cf_prompt is not None else "cli",
-        choices_path=config.cf_resolution_file,
-        prompt=cf_prompt,
-    )
+    resolution_manager = CFResolutionManager(mode="cli")
     total_steps = 6
     current_step = 0
     _emit_progress(
@@ -481,6 +657,23 @@ def create_flow_priority(
         current=current_step,
         total=total_steps,
     )
+    category_path_warning = _category_path_warning(
+        database_archive.source_name,
+        metadata_path.name,
+        database_archive.category_path_diagnostics,
+        source_format=database_archive.source_format,
+    )
+    if category_path_warning is not None:
+        warnings.append(category_path_warning)
+    for parse_warning in _archive_parse_warnings(database_archive):
+        warnings.append(
+            _parse_warning_record(
+                source_name=database_archive.source_name,
+                source_file=parse_warning["source_file"],
+                message=parse_warning["message"],
+                input_role="database input",
+            )
+        )
 
     _emit_progress(
         progress_callback,
@@ -490,22 +683,47 @@ def create_flow_priority(
         total=total_steps,
     )
     methods_archive = (
-        index_archive(config.methods, require_processes=False, require_flows=False)
+        index_archive(
+            config.methods,
+            require_processes=False,
+            require_flows=False,
+            ecospold_xml_error_policy="warn_skip",
+        )
         if config.methods
         else None
     )
+    method_parse_warnings = _archive_parse_warnings(methods_archive)
+    if methods_archive is not None:
+        source_name = Path(config.methods).name if config.methods else methods_archive.source_name
+        for parse_warning in method_parse_warnings:
+            warnings.append(
+                _parse_warning_record(
+                    source_name=source_name,
+                    source_file=parse_warning["source_file"],
+                    message=parse_warning["message"],
+                    input_role="optional methods input",
+                )
+            )
     current_step += 1
     _emit_progress(
         progress_callback,
         step="load_methods",
         message=(
-            "Step 2/6: Optional methods indexed."
+            (
+                "Step 2/6: Optional methods indexed."
+                if not method_parse_warnings
+                else (
+                    "Step 2/6: Optional methods indexed. "
+                    f"Skipped {len(method_parse_warnings)} malformed EcoSpold1 XML file(s) in the optional methods input."
+                )
+            )
             if methods_archive is not None
             else "Step 2/6: No external methods input provided."
         ),
         current=current_step,
         total=total_steps,
     )
+    input_parse_warnings = [*_archive_parse_warnings(database_archive), *method_parse_warnings]
 
     _emit_progress(
         progress_callback,
@@ -517,6 +735,10 @@ def create_flow_priority(
     archives, lcia_method_source, internal_lcia_methods_ignored = resolve_lcia_archives(
         database_archive,
         methods_archive,
+    )
+    active_unit_registry = merge_unit_registries(
+        getattr(database_archive, "units", {}),
+        getattr(methods_archive, "units", {}) if methods_archive is not None else {},
     )
     categories = collect_categories(
         archives,
@@ -541,6 +763,11 @@ def create_flow_priority(
     )
     selected_categories = list(select_lcia_categories(categories, config.method_selection))
     empty_selected_categories = list(ensure_category_factor_quality(selected_categories, warnings))
+    _raise_if_no_selected_categories(
+        selected_categories=selected_categories,
+        methods_input=config.methods,
+        input_parse_warnings=input_parse_warnings,
+    )
     current_step += 1
     _emit_progress(
         progress_callback,
@@ -551,7 +778,6 @@ def create_flow_priority(
     )
 
     process_total = len(database_archive.processes)
-    process_lookup = {locator.path: locator for locator in database_archive.processes.values()}
     _emit_progress(
         progress_callback,
         step="audit_processes",
@@ -563,33 +789,52 @@ def create_flow_priority(
     )
     last_progress_at = 0.0
     process_index = 0
-    selected_category_ids = {category.category_id for category in selected_categories}
-    for rel_path, raw_bytes in iter_source_entries(database_archive.resolved_source_path):
-        locator = process_lookup.get(rel_path)
-        if locator is None:
-            continue
-        process_data = parse_json_object(raw_bytes, rel_path)
+    if database_archive.source_format == "ecospold1":
+        process_iterable = iter_ecospold_processes(database_archive)
+    else:
+        process_lookup = {locator.path: locator for locator in database_archive.processes.values()}
+        process_iterable = (
+            (locator, parse_json_object(raw_bytes, rel_path))
+            for rel_path, raw_bytes in iter_source_entries(database_archive.resolved_source_path)
+            for locator in [process_lookup.get(rel_path)]
+            if locator is not None
+        )
+    for locator, process_data in process_iterable:
         exchanges = list(process_data.get("exchanges") or [])
-        matrix, candidate_indices, exchange_keys, _characterised_flags, resolved_mask = build_contribution_details(
+        sparse_details = build_sparse_contribution_details(
             exchanges=exchanges,
             flow_lookup=database_archive.flows,
             categories=selected_categories,
-            unit_registry=database_archive.units,
+            unit_registry=active_unit_registry,
             strict_units=config.strict_units,
             tol=config.tolerance,
+            allow_water_mass_volume_override=config.allow_water_mass_volume_override,
             process_data=process_data,
             warning_records=warnings,
             ambiguity_records=cf_ambiguities,
             diagnostic_file="lcia_flow_priority_metadata.json",
             resolution_manager=resolution_manager,
+            max_scenario_rows_per_process=config.max_scenario_rows_per_process,
+            max_candidate_set_size=config.max_candidate_set_size,
+            include_resolved_mask=False,
+        )
+        candidate_indices = list(sparse_details.candidate_indices)
+        exchange_keys = list(sparse_details.exchange_keys)
+        positive_model = build_sparse_cover_matrix(
+            sparse_details.rowsets,
+            len(candidate_indices),
+            positive=True,
+            tol=config.tolerance,
+        )
+        negative_model = build_sparse_cover_matrix(
+            sparse_details.rowsets,
+            len(candidate_indices),
+            positive=False,
+            tol=config.tolerance,
         )
         flow_ids: List[str] = []
-        characterised_mask = resolved_mask.any(axis=0) if resolved_mask.size else np.zeros(len(candidate_indices), dtype=bool)
-        nonzero_characterised = (
-            np.any(np.abs(matrix) > config.tolerance, axis=0)
-            if matrix.size
-            else np.zeros(len(candidate_indices), dtype=bool)
-        )
+        characterised_mask = np.asarray(sparse_details.characterised_flags, dtype=bool)
+        nonzero_characterised = column_nonzero_mask(positive_model) | column_nonzero_mask(negative_model)
         for local_index, exchange_index in enumerate(candidate_indices):
             exchange = exchanges[exchange_index]
             flow_id = exchange_flow_id(exchange)
@@ -600,19 +845,38 @@ def create_flow_priority(
                 flow_aggregates,
                 flow,
                 fallback_unit=exchange_unit_name(exchange) or "",
-                unit_registry=database_archive.units,
+                unit_registry=active_unit_registry,
                 audit_tau_values=audit_tau_values,
             )
             aggregate.occurrence_count += 1
             if characterised_mask[local_index]:
                 aggregate.characterised_occurrence_count += 1
-            for row_index, category in enumerate(selected_categories):
-                if resolved_mask.shape[0] > row_index and resolved_mask[row_index, local_index]:
-                    aggregate.resolved_categories.add(category.category_id)
             flow_ids.append(flow_id)
 
-        positive_ladder = build_greedy_ladder(np.maximum(matrix, 0.0), exchange_keys=exchange_keys, tol=config.tolerance)
-        negative_ladder = build_greedy_ladder(np.maximum(-matrix, 0.0), exchange_keys=exchange_keys, tol=config.tolerance)
+        positive_sparse_ladder = build_greedy_ladder_sparse(
+            positive_model,
+            exchange_keys=exchange_keys,
+            tol=config.tolerance,
+        )
+        negative_sparse_ladder = build_greedy_ladder_sparse(
+            negative_model,
+            exchange_keys=exchange_keys,
+            tol=config.tolerance,
+        )
+        positive_ladder = GreedyLadder(
+            order=list(positive_sparse_ladder.order),
+            entry_thresholds=positive_sparse_ladder.entry_thresholds,
+            lambda_after=positive_sparse_ladder.lambda_after,
+            full=positive_sparse_ladder.full,
+            active=positive_sparse_ladder.active,
+        )
+        negative_ladder = GreedyLadder(
+            order=list(negative_sparse_ladder.order),
+            entry_thresholds=negative_sparse_ladder.entry_thresholds,
+            lambda_after=negative_sparse_ladder.lambda_after,
+            full=negative_sparse_ladder.full,
+            active=negative_sparse_ladder.active,
+        )
         combined_entry = _combine_entry_thresholds(
             positive_ladder.entry_thresholds,
             negative_ladder.entry_thresholds,
@@ -624,11 +888,10 @@ def create_flow_priority(
             flow_id = flow_ids[local_index]
             flow_aggregates[flow_id].tau_entries.append(tau_entry)
 
-        _update_flow_metrics_for_sign(
-            np.maximum(matrix, 0.0),
+        _update_flow_metrics_for_sign_sparse(
+            positive_model,
             positive_ladder,
             flow_ids,
-            selected_categories,
             audit_tau_values,
             flow_aggregates,
             config.tolerance,
@@ -636,11 +899,10 @@ def create_flow_priority(
             process_id=str(process_data.get("@id") or process_data.get("id") or locator.object_id),
             sign="+",
         )
-        _update_flow_metrics_for_sign(
-            np.maximum(-matrix, 0.0),
+        _update_flow_metrics_for_sign_sparse(
+            negative_model,
             negative_ladder,
             flow_ids,
-            selected_categories,
             audit_tau_values,
             flow_aggregates,
             config.tolerance,
@@ -650,18 +912,21 @@ def create_flow_priority(
         )
 
         process_index += 1
+        process_label = str(process_data.get("name") or locator.name)
+        if process_index % 50 == 0:
+            gc.collect()
         now = time.monotonic()
         if process_index == 1 or process_index == process_total or now - last_progress_at >= 0.15:
             last_progress_at = now
             _emit_progress(
                 progress_callback,
                 step="audit_processes",
-                message=_process_progress_message(process_index, process_total, str(process_data.get("name") or locator.name)),
+                message=_process_progress_message(process_index, process_total, process_label),
                 current=current_step,
                 total=total_steps,
                 process_current=process_index,
                 process_total=process_total,
-                process_name=str(process_data.get("name") or locator.name),
+                process_name=process_label,
             )
     current_step += 1
     _emit_progress(
@@ -682,15 +947,16 @@ def create_flow_priority(
         total=total_steps,
     )
     metric_columns = _metric_columns(audit_tau_values)
-    fieldnames = [*_BASE_COLUMNS, *metric_columns, "cf_status"]
-    rows = [
-        _csv_row(flow_aggregates[flow_id], audit_tau_values, selected_category_ids)
+    fieldnames = [*_BASE_COLUMNS, *metric_columns]
+    rows = (
+        _csv_row(flow_aggregates[flow_id], audit_tau_values)
         for flow_id in sorted(flow_aggregates)
-    ]
+    )
     write_manifest_csv(csv_path, rows, fieldnames)
     metadata = {
         "file_type": "lcia_flow_priority",
         "schema_version": 1,
+        "source_format": database_archive.source_format,
         "database_name": database_archive.source_name,
         "database_version": None,
         "database_hash": _hash_path(config.database),
@@ -704,13 +970,15 @@ def create_flow_priority(
         ],
         "audit_tau_values": audit_tau_values,
         "unit_policy": "strict" if config.strict_units else "non_strict",
+        "allow_water_mass_volume_override": config.allow_water_mass_volume_override,
         "cf_resolution_policy": {
-            "mode": "gui" if cf_prompt is not None else "cli",
-            "saved_choices_path": config.cf_resolution_file or "",
-            "saved_choice_reuse_enabled": bool(config.cf_resolution_file),
-            "interactive_prompt_enabled": bool(cf_prompt is not None),
+            "mode": "finite_scenario_rows",
+            "cf_ambiguity_policy": "finite_scenario_rows",
+            "scenario_limits": {
+                "max_scenario_rows_per_process": config.max_scenario_rows_per_process,
+                "max_candidate_set_size": config.max_candidate_set_size,
+            },
         },
-        "cf_resolution_choices_hash": _choice_history_hash(resolution_manager),
         "algorithm": "nested_greedy_lcia_flow_priority",
         "algorithm_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -718,9 +986,22 @@ def create_flow_priority(
         "csv_columns": fieldnames,
         "n_processes_total": process_total,
         "n_elementary_occurrences_total": sum(item.occurrence_count for item in flow_aggregates.values()),
-        "n_flows_ranked": len(rows),
+        "n_flows_ranked": len(flow_aggregates),
+        "flow_category_path_diagnostics": database_archive.category_path_diagnostics.__dict__,
         "n_warning_records": len(warnings),
         "n_cf_ambiguity_records": len(cf_ambiguities),
+        "metadata_record_sample_limit": _METADATA_RECORD_SAMPLE_LIMIT,
+        "warnings_truncated_in_metadata": len(warnings) > _METADATA_RECORD_SAMPLE_LIMIT,
+        "cf_ambiguities_truncated_in_metadata": len(cf_ambiguities) > _METADATA_RECORD_SAMPLE_LIMIT,
+        "diagnostics_policy": {
+            "priority_default_outputs": [
+                "lcia_flow_priority.csv",
+                "lcia_flow_priority_metadata.json",
+            ],
+            "full_warning_records": "not_written_by_priority_default",
+            "full_cf_ambiguity_records": "not_written_by_priority_default",
+            "full_cf_ambiguity_review": "use_explore-ambiguities_workflow",
+        },
         "cf_resolution_summary": resolution_manager.summary.__dict__,
         "notes": [
             "eta is the single-flow certificate shortfall after overshoot margin is subtracted.",
@@ -728,7 +1009,8 @@ def create_flow_priority(
             "Group eta cannot be computed exactly by summing single-flow eta values.",
             "Summed loss_max values provide a conservative upper bound for group-risk screening.",
         ],
-        "warnings": [warning.__dict__ for warning in warnings],
+        "warnings": [warning.__dict__ for warning in warnings.sample],
+        "cf_ambiguity_samples": [record.__dict__ for record in cf_ambiguities.sample],
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=True), encoding="utf-8")
     current_step += 1

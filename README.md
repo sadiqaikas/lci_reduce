@@ -113,6 +113,9 @@ If a flow name contains commas, prefer repeating `--select-flow-name` instead of
 
 The analyser uses the compact priority CSV only.
 
+The default compact priority CSV no longer writes `cf_status`.
+`analyse-priority` still accepts older CSVs that include `cf_status`.
+
 - `eta_tau` is the exact single-flow certificate shortfall for omitting that one flow at the chosen audit tau.
 - `loss_max_tau` is the maximum raw retained-coverage loss before overshoot margin.
 - For a selected flow set `F`, the analyser does not claim exact combined `eta_F`.
@@ -134,6 +137,7 @@ The GUI uses the same backend as the CLI and now includes:
 
 - a reduction tab for inspection and run execution
 - a flow-priority tab for LCIA transfer-priority sidecars
+- a single-process greedy-vs-exact diagnostic tab for selector validation
 - a priority-analyser tab for compact priority CSV screening
 - a reduction-curves tab for comparing completed runs across multiple tau values
 - a CLI info tab with copy-ready commands and workflow guidance
@@ -155,6 +159,45 @@ Package entrypoint:
 ```bash
 python -m lci_reduce
 ```
+
+## Greedy vs exact diagnostic
+
+The greedy-vs-exact diagnostic is not a second reducer.
+
+It reuses the normal sparse reducer semantics for one selected process:
+
+- same JSON-LD parsing
+- same LCIA category selection
+- same unit conversion and CF resolution
+- same sparse contribution details
+- same positive and negative sparse cover models
+- same final coverage verification with `retained_by_row`
+
+The greedy branch uses the same `signed_tau_cover_sparse(...)` selector as the normal reducer.
+
+The exact branch swaps only the per-sign selector step:
+
+- solve the positive sparse cover model exactly
+- solve the negative sparse cover model exactly
+- union the exact selector masks
+- apply protected-exchange retention afterward, exactly as the normal reducer does for export preservation
+
+Protected exchanges are therefore a database-preservation policy, not part of the exact selector objective.
+
+The diagnostic reports both selector counts and exported elementary-exchange counts. For `sign_mode=both`, exact selector dominance is only asserted per sign:
+
+- exact positive selector count must not exceed greedy positive selector count
+- exact negative selector count must not exceed greedy negative selector count
+
+The diagnostic does not claim that the exact union selector count must always be less than or equal to the greedy union selector count under separate sign-wise optimisation.
+
+An exact diagnostic clone is written only if the exact result is:
+
+- solver-optimal where required
+- certificate-valid for the solved sign models
+- certificate-valid after protected exchanges are added for export
+
+If exact verification fails, the tool writes no exact clone and records the failure explicitly in metadata and, when available, an exact-debug CSV.
 
 ## Development
 

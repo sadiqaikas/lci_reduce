@@ -37,7 +37,6 @@ def _write_priority_csv(path: Path) -> Path:
         "loss_max_0_95",
         "eta_0_99",
         "loss_max_0_99",
-        "cf_status",
     ]
     rows = [
         {
@@ -54,8 +53,7 @@ def _write_priority_csv(path: Path) -> Path:
             "eta_0_95": "0",
             "loss_max_0_95": "0",
             "eta_0_99": "0.99",
-            "loss_max_0_99": "0.4",
-            "cf_status": "characterised",
+            "loss_max_0_99": "0.99",
         },
         {
             "flow_id": "flow-b",
@@ -64,7 +62,7 @@ def _write_priority_csv(path: Path) -> Path:
             "subcompartment": "fresh water",
             "reference_unit": "kg",
             "occurrence_count": "3",
-            "characterised_occurrence_count": "3",
+            "characterised_occurrence_count": "2",
             "tau_entry_min": "0.5",
             "tau_entry_median": "0.6",
             "tau_entry_max": "0.7",
@@ -72,7 +70,6 @@ def _write_priority_csv(path: Path) -> Path:
             "loss_max_0_95": "1",
             "eta_0_99": "0",
             "loss_max_0_99": "0",
-            "cf_status": "partly_characterised",
         },
         {
             "flow_id": "flow-c",
@@ -89,7 +86,6 @@ def _write_priority_csv(path: Path) -> Path:
             "loss_max_0_95": "0.3",
             "eta_0_99": "0.4",
             "loss_max_0_99": "0.7",
-            "cf_status": "uncharacterised",
         },
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -190,3 +186,57 @@ def test_core_tail_flow_name_column_has_scrollable_width(qapp) -> None:
     panel = PriorityAnalyserPanel()
     assert panel.core_table.columnWidth(1) >= 360
     assert panel.tail_table.columnWidth(1) >= 360
+
+
+def test_loading_legacy_cf_status_csv_is_still_supported(tmp_path: Path, qapp) -> None:
+    csv_path = tmp_path / "priority_legacy.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "flow_id",
+                "flow_name",
+                "compartment",
+                "subcompartment",
+                "reference_unit",
+                "occurrence_count",
+                "characterised_occurrence_count",
+                "tau_entry_min",
+                "tau_entry_median",
+                "tau_entry_max",
+                "eta_0_95",
+                "loss_max_0_95",
+                "eta_0_99",
+                "loss_max_0_99",
+                "cf_status",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "flow_id": "legacy-flow",
+                "flow_name": "Legacy",
+                "compartment": "air",
+                "subcompartment": "urban air",
+                "reference_unit": "kg",
+                "occurrence_count": "1",
+                "characterised_occurrence_count": "1",
+                "tau_entry_min": "0.1",
+                "tau_entry_median": "0.1",
+                "tau_entry_max": "0.1",
+                "eta_0_95": "0",
+                "loss_max_0_95": "0",
+                "eta_0_99": "0",
+                "loss_max_0_99": "0",
+                "cf_status": "characterised",
+            }
+        )
+
+    panel = PriorityAnalyserPanel()
+    panel.priority_csv_edit.setText(str(csv_path))
+    panel.load_priority_file()
+    QApplication.processEvents()
+
+    assert panel.dataset is not None
+    assert panel.dataset.has_cf_status_column is True
+    assert "legacy cf_status detected" in panel.load_status_label.text()

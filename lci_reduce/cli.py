@@ -4,25 +4,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from typing import Any, Optional, Sequence
 
-from .cf_resolution import PromptCallback
 from .errors import LciReduceError
+from .archive_reader import index_archive, inspect_archives
+from .ambiguity_explorer import explore_ambiguities
 from .flow_priority import create_flow_priority
-from .jsonld_reader import index_archive, inspect_archives
-from .jsonld_writer import ProgressCallback, create_lite_database
-from .models import CreateConfig, FlowPriorityConfig
+from .reduction_runner import ProgressCallback, create_lite_database
+from .models import AmbiguityExploreConfig, CreateConfig, FlowPriorityConfig
 from .priority_analyser import (
     PriorityRecord,
     build_priority_summary,
     load_priority_dataset,
     match_flow_ids,
     match_flow_names,
-    parse_repeated_option_items,
+    parse_repeated_option_items,    
     SelectionMatchResult,
     write_ranked_csv,
     write_summary_json,
 )
+from .priority_glad import format_priority_glad_report, write_priority_glad_outputs
 
 
 CLI_GUIDE_SECTIONS = [
@@ -47,7 +49,7 @@ CLI_GUIDE_SECTIONS = [
         "title": "2. Create A Lite Database",
         "summary": (
             "Run deterministic signed tau-cover reduction. This is the command that writes the reduced JSON-LD ZIP "
-            "plus manifests, validation, warnings, config, and report artefacts."
+            "plus a compact run summary and per-process debug log."
         ),
         "command": (
             "lci_reduce create \\\n"
@@ -62,7 +64,7 @@ CLI_GUIDE_SECTIONS = [
         "notes": [
             "Use `--method-selection all` to include every detected LCIA category, or pass your existing selection string if you already use a narrower set.",
             "Strict units are on by default. If unit compatibility is ambiguous, the run should fail instead of guessing.",
-            "Expected outputs are the lite database ZIP plus `exchange_manifest.csv`, `process_manifest.csv`, `run_summary.json`, warnings, config, and the short PDF report.",
+            "Expected outputs are `reduced_database.zip`, `run_summary.json`, and `reduction_debug.ndjson`.",
         ],
     },
     {
@@ -87,7 +89,28 @@ CLI_GUIDE_SECTIONS = [
         ],
     },
     {
-        "title": "4. Analyse An Existing Priority File",
+        "title": "4. Explore LCIA Ambiguities",
+        "summary": (
+            "Scan JSON-LD or EcoSpold1 inputs and selected LCIA methods for ambiguity records without creating a reduced database. "
+            "This is the dedicated workflow for critical ambiguity review."
+        ),
+        "command": (
+            "lci_reduce explore-ambiguities \\\n"
+            "  --database /path/to/original_database.zip \\\n"
+            "  --methods /path/to/methods.zip \\\n"
+            "  --output /path/to/out_dir \\\n"
+            "  --method-selection all \\\n"
+            "  --strict-units true"
+        ),
+        "notes": [
+            "Expected outputs are `cf_ambiguities.csv` and `cf_ambiguities_metadata.json`.",
+            "The explorer reuses the same CF resolution logic as reduction, but it does not write a lite database and it keeps scanning after unresolved ambiguity.",
+            "Use the JSON-LD tab for JSON-LD archives and the EcoSpold1 tab for EcoSpold1 folders, XML files, or archives.",
+            "Use it when you want to inspect whether ambiguity is real, duplicated, method-mixed, or only an artefact of incomplete metadata.",
+        ],
+    },
+    {
+        "title": "5. Analyse An Existing Priority File",
         "summary": (
             "Use the compact priority CSV directly. This analyser does not need the original database ZIP, "
             "does not need a failed mappings CSV, and does not rewrite anything."
@@ -106,12 +129,16 @@ CLI_GUIDE_SECTIONS = [
         ),
         "notes": [
             "The analyser validates the CSV schema and detects available audit tau column pairs before doing any ranking.",
-            "For grouped selected flows it reports a compact-screen bound only: `max eta <= exact group eta <= min(tau, sum loss_max)`.",
+            (
+                "For grouped selected flows it reports a compact-screen bound only: "
+                "the lower bound is `max eta`, and the upper bound uses one selected flow's observed `eta` "
+                "plus `loss_max` for the remaining selected flows, capped at tau."
+            ),
             "If a flow name contains commas, prefer repeating `--select-flow-name` instead of packing several names into one comma-separated argument.",
         ],
     },
     {
-        "title": "5. Start The Desktop GUI",
+        "title": "6. Start The Desktop GUI",
         "summary": (
             "Use the GUI when you want guided file picking, embedded method hints, interactive priority screening, "
             "or reduction-curve comparisons."
@@ -123,7 +150,7 @@ CLI_GUIDE_SECTIONS = [
         ],
     },
     {
-        "title": "6. Alternate Entrypoints",
+        "title": "7. Alternate Entrypoints",
         "summary": "These forms are useful when you are running directly from a checkout without installing console scripts.",
         "command": (
             "python -m lci_reduce cli inspect --database /path/to/original_database.zip\n"
@@ -158,6 +185,13 @@ def _positive_int_arg(value: str) -> int:
     return parsed
 
 
+def _stderr_progress(update: Any) -> None:
+    process = ""
+    if update.process_current is not None and update.process_total is not None:
+        process = f" [{update.process_current}/{update.process_total}]"
+    print(f"{update.message}{process}", file=sys.stderr, flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lci_reduce",
@@ -178,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     create_parser = subparsers.add_parser(
         "create",
-        help="Create a lite JSON-LD database ZIP plus validation artefacts.",
+        help="Create a lite JSON-LD database ZIP plus compact summary/debug artefacts.",
     )
     create_parser.add_argument("--database", required=True)
     create_parser.add_argument("--methods")
@@ -191,8 +225,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["keep", "drop", "fail"],
     )
     create_parser.add_argument("--strict-units", default=True, type=_bool_arg)
+    create_parser.add_argument("--allow-water-mass-volume-override", default=False, type=_bool_arg)
     create_parser.add_argument("--tolerance", default=1e-12, type=float)
-    create_parser.add_argument("--cf-resolution-file")
+    create_parser.add_argument("--max-scenario-rows-per-process", default=300000, type=_positive_int_arg)
+    create_parser.add_argument("--max-candidate-set-size", default=500, type=_positive_int_arg)
+    create_parser.add_argument("--fail-fast", default=True, type=_bool_arg)
 
     priority_parser = subparsers.add_parser(
         "priority",
@@ -204,8 +241,23 @@ def build_parser() -> argparse.ArgumentParser:
     priority_parser.add_argument("--method-selection", required=True)
     priority_parser.add_argument("--audit-tau", nargs="+", default=[0.95, 0.99], type=float)
     priority_parser.add_argument("--strict-units", default=True, type=_bool_arg)
+    priority_parser.add_argument("--allow-water-mass-volume-override", default=False, type=_bool_arg)
     priority_parser.add_argument("--tolerance", default=1e-12, type=float)
-    priority_parser.add_argument("--cf-resolution-file")
+    priority_parser.add_argument("--max-scenario-rows-per-process", default=300000, type=_positive_int_arg)
+    priority_parser.add_argument("--max-candidate-set-size", default=500, type=_positive_int_arg)
+    priority_parser.add_argument("--verbose", action="store_true", help="Print priority audit progress to stderr.")
+
+    ambiguity_parser = subparsers.add_parser(
+        "explore-ambiguities",
+        help="Scan LCIA ambiguities from JSON-LD or EcoSpold1 inputs without creating a reduced database.",
+    )
+    ambiguity_parser.add_argument("--database", required=True)
+    ambiguity_parser.add_argument("--methods")
+    ambiguity_parser.add_argument("--output", required=True)
+    ambiguity_parser.add_argument("--method-selection", required=True)
+    ambiguity_parser.add_argument("--strict-units", default=True, type=_bool_arg)
+    ambiguity_parser.add_argument("--allow-water-mass-volume-override", default=False, type=_bool_arg)
+    ambiguity_parser.add_argument("--tolerance", default=1e-12, type=float)
 
     analyse_priority_parser = subparsers.add_parser(
         "analyse-priority",
@@ -224,6 +276,20 @@ def build_parser() -> argparse.ArgumentParser:
     analyse_priority_parser.add_argument("--select-flow-name", action="append")
     analyse_priority_parser.add_argument("--output-summary-json")
     analyse_priority_parser.add_argument("--output-ranked-csv")
+
+    match_priority_glad_parser = subparsers.add_parser(
+        "match-priority-glad",
+        help="Match an existing lcia_flow_priority.csv directly to bundled GLAD target flow lists.",
+    )
+    match_priority_glad_parser.add_argument("--priority-csv", required=True)
+    match_priority_glad_parser.add_argument("--metadata-json")
+    match_priority_glad_parser.add_argument(
+        "--audit-tau",
+        type=float,
+        default=None,
+        help="Audit tau to analyse. Defaults to 0.95 if present, otherwise the first detected tau pair.",
+    )
+    match_priority_glad_parser.add_argument("--output", required=True)
     return parser
 
 
@@ -240,11 +306,15 @@ def inspect_command(database: str, methods: Optional[str]) -> dict:
             require_processes=False,
             require_flows=False,
             conversion_scope="inspect",
+            ecospold_xml_error_policy="warn_skip",
         )
         if methods
         else None
     )
     result = inspect_archives(database_archive, methods_archive)
+    input_parse_warnings = list(database_archive.extra.get("parse_warnings", []))
+    if methods_archive is not None:
+        input_parse_warnings.extend(methods_archive.extra.get("parse_warnings", []))
     return {
         "detected_processes": result.n_processes,
         "detected_flows": result.n_flows,
@@ -265,6 +335,8 @@ def inspect_command(database: str, methods: Optional[str]) -> dict:
         "method_names": result.method_names,
         "lcia_categories": [row.__dict__ for row in result.lcia_categories],
         "empty_lcia_categories": [row.__dict__ for row in result.empty_lcia_categories],
+        "n_input_parse_warnings": len(input_parse_warnings),
+        "input_parse_warnings": input_parse_warnings,
     }
 
 
@@ -277,9 +349,11 @@ def create_command(
     uncharacterised_policy: str,
     strict_units: bool,
     tolerance: float,
-    cf_resolution_file: Optional[str] = None,
+    allow_water_mass_volume_override: bool = False,
+    max_scenario_rows_per_process: int = 300000,
+    max_candidate_set_size: int = 1000,
+    fail_fast: bool = True,
     *,
-    cf_prompt: Optional[PromptCallback] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ):
     config = CreateConfig(
@@ -291,9 +365,12 @@ def create_command(
         uncharacterised_policy=uncharacterised_policy,
         strict_units=strict_units,
         tolerance=tolerance,
-        cf_resolution_file=cf_resolution_file,
+        allow_water_mass_volume_override=allow_water_mass_volume_override,
+        max_scenario_rows_per_process=max_scenario_rows_per_process,
+        max_candidate_set_size=max_candidate_set_size,
+        fail_fast=fail_fast,
     )
-    return create_lite_database(config, cf_prompt=cf_prompt, progress_callback=progress_callback)
+    return create_lite_database(config, progress_callback=progress_callback)
 
 
 def priority_command(
@@ -304,9 +381,10 @@ def priority_command(
     audit_tau: list[float],
     strict_units: bool,
     tolerance: float,
-    cf_resolution_file: Optional[str] = None,
+    allow_water_mass_volume_override: bool = False,
+    max_scenario_rows_per_process: int = 300000,
+    max_candidate_set_size: int = 1000,
     *,
-    cf_prompt: Optional[PromptCallback] = None,
     progress_callback: Optional[ProgressCallback] = None,
 ):
     config = FlowPriorityConfig(
@@ -317,9 +395,36 @@ def priority_command(
         audit_tau_values=list(audit_tau),
         strict_units=strict_units,
         tolerance=tolerance,
-        cf_resolution_file=cf_resolution_file,
+        allow_water_mass_volume_override=allow_water_mass_volume_override,
+        max_scenario_rows_per_process=max_scenario_rows_per_process,
+        max_candidate_set_size=max_candidate_set_size,
     )
-    return create_flow_priority(config, cf_prompt=cf_prompt, progress_callback=progress_callback)
+    return create_flow_priority(config, progress_callback=progress_callback)
+
+
+def explore_ambiguities_command(
+    database: str,
+    methods: Optional[str],
+    output: str,
+    method_selection: str,
+    strict_units: bool,
+    tolerance: float,
+    allow_water_mass_volume_override: bool = False,
+    max_processes: int = 100,
+    *,
+    progress_callback: Optional[ProgressCallback] = None,
+):
+    config = AmbiguityExploreConfig(
+        database=database,
+        methods=methods,
+        output_dir=output,
+        method_selection=method_selection,
+        strict_units=strict_units,
+        tolerance=tolerance,
+        allow_water_mass_volume_override=allow_water_mass_volume_override,
+        max_processes=max_processes,
+    )
+    return explore_ambiguities(config, progress_callback=progress_callback)
 
 
 def analyse_priority_command(
@@ -358,6 +463,20 @@ def analyse_priority_command(
     if output_summary_json:
         write_summary_json(output_summary_json, summary)
     return summary
+
+
+def match_priority_glad_command(
+    priority_csv: str,
+    output: str,
+    metadata_json: Optional[str] = None,
+    audit_tau: float | None = None,
+):
+    return write_priority_glad_outputs(
+        priority_csv=priority_csv,
+        output_dir=output,
+        metadata_json=metadata_json,
+        audit_tau=audit_tau,
+    )
 
 
 def _combine_selection_results(*results: SelectionMatchResult) -> SelectionMatchResult:
@@ -458,6 +577,7 @@ def format_analyse_priority_report(summary: dict[str, Any]) -> str:
             [
                 "",
                 "Compact-Screen Group Bound",
+                "  rule: upper bound uses one selected flow's eta plus loss_max for the remaining selected flows, capped at tau",
                 f"  lower bound: {_format_metric(selected_analysis['lower_bound_eta'])}",
                 f"  upper bound: {_format_metric(selected_analysis['upper_bound_eta'])}",
                 f"  sum loss_max: {_format_metric(selected_analysis['sum_loss_max'])}",
@@ -502,15 +622,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 uncharacterised_policy=args.uncharacterised_policy,
                 strict_units=args.strict_units,
                 tolerance=args.tolerance,
-                cf_resolution_file=args.cf_resolution_file,
+                allow_water_mass_volume_override=args.allow_water_mass_volume_override,
+                max_scenario_rows_per_process=args.max_scenario_rows_per_process,
+                max_candidate_set_size=args.max_candidate_set_size,
+                fail_fast=args.fail_fast,
             )
             print(
                 json.dumps(
                     {
                         "output_zip": result.output_zip,
-                        "exchange_manifest_csv": result.exchange_manifest_csv,
-                        "process_manifest_csv": result.process_manifest_csv,
                         "run_summary_json": result.run_summary_json,
+                        "reduction_debug_ndjson": result.reduction_debug_ndjson,
                     },
                     indent=2,
                     ensure_ascii=True,
@@ -525,13 +647,36 @@ def main(argv: Optional[list[str]] = None) -> int:
                 audit_tau=args.audit_tau,
                 strict_units=args.strict_units,
                 tolerance=args.tolerance,
-                cf_resolution_file=args.cf_resolution_file,
+                allow_water_mass_volume_override=args.allow_water_mass_volume_override,
+                max_scenario_rows_per_process=args.max_scenario_rows_per_process,
+                max_candidate_set_size=args.max_candidate_set_size,
+                progress_callback=_stderr_progress if args.verbose else None,
             )
             print(
                 json.dumps(
                     {
                         "flow_priority_csv": result.flow_priority_csv,
                         "flow_priority_metadata_json": result.flow_priority_metadata_json,
+                    },
+                    indent=2,
+                    ensure_ascii=True,
+                )
+            )
+        elif args.command == "explore-ambiguities":
+            result = explore_ambiguities_command(
+                database=args.database,
+                methods=args.methods,
+                output=args.output,
+                method_selection=args.method_selection,
+                strict_units=args.strict_units,
+                tolerance=args.tolerance,
+                allow_water_mass_volume_override=args.allow_water_mass_volume_override,
+            )
+            print(
+                json.dumps(
+                    {
+                        "cf_ambiguities_csv": result.cf_ambiguities_csv,
+                        "cf_ambiguity_metadata_json": result.cf_ambiguity_metadata_json,
                     },
                     indent=2,
                     ensure_ascii=True,
@@ -549,6 +694,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 output_ranked_csv=args.output_ranked_csv,
             )
             print(format_analyse_priority_report(summary))
+        elif args.command == "match-priority-glad":
+            summary = match_priority_glad_command(
+                priority_csv=args.priority_csv,
+                metadata_json=args.metadata_json,
+                audit_tau=args.audit_tau,
+                output=args.output,
+            )
+            print(format_priority_glad_report(summary))
         return 0
     except LciReduceError as exc:
         parser.exit(1, f"{exc}\n")

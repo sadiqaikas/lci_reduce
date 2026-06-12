@@ -11,7 +11,7 @@ from typing import Callable, Iterable, Optional
 
 from .contribution import exchange_flow_id
 from .errors import RunCancelledError
-from .jsonld_reader import index_archive, iter_source_entries, parse_json_object
+from .archive_reader import index_archive, iter_source_entries, parse_json_object
 from .models import TauReductionRun
 
 

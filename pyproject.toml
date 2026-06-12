@@ -14,6 +14,7 @@ authors = [
 dependencies = [
   "matplotlib>=3.8",
   "numpy>=1.24",
+  "scipy>=1.11",
   "reportlab>=4.0",
   "PySide6>=6.5",
 ]
@@ -28,7 +29,7 @@ lci_reduce = "lci_reduce.cli:main"
 lci_reduce-gui = "lci_reduce.gui:main"
 
 [tool.setuptools]
-packages = ["lci_reduce"]
+packages = ["lci_reduce", "lca_flowkit"]
 
 [tool.setuptools.package-data]
 lci_reduce = [

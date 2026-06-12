@@ -390,7 +390,7 @@ def test_native_zolca_database_with_embedded_methods(tmp_path: Path):
     )
     result_json = json.loads(create_result.stdout)
     assert Path(result_json["output_zip"]).exists()
-    assert Path(result_json["exchange_manifest_csv"]).exists()
+    assert Path(result_json["reduction_debug_ndjson"]).exists()
 
 
 @native_support

@@ -1,0 +1,34 @@
+{
+  "upstream_repo": "https://github.com/UNEP-Economy-Division/GLAD-ElementaryFlowResources",
+  "generated_at_utc": "2026-06-10T19:26:23.021382+00:00",
+  "notes": [
+    "GLAD flow-list CSV snapshots are the authoritative assets used for direct target matching.",
+    "GLAD pairwise Excel mapping workbooks exist upstream but are not used as the primary matcher for arbitrary source databases."
+  ],
+  "targets": {
+    "ecoinventEFv3.7": {
+      "upstream_repo": "https://github.com/UNEP-Economy-Division/GLAD-ElementaryFlowResources",
+      "upstream_file": "Mapping/Input/Flowlists/ecoinventEFv3.7.csv",
+      "snapshot_file": "ecoinventEFv3.7.csv",
+      "row_count": 4310
+    },
+    "ILCD_EFv3.0": {
+      "upstream_repo": "https://github.com/UNEP-Economy-Division/GLAD-ElementaryFlowResources",
+      "upstream_file": "Mapping/Input/Flowlists/ILCD_EFv3.0.csv",
+      "snapshot_file": "ILCD_EFv3.0.csv",
+      "row_count": 93993
+    },
+    "FEDEFLv1.0.3": {
+      "upstream_repo": "https://github.com/UNEP-Economy-Division/GLAD-ElementaryFlowResources",
+      "upstream_file": "Mapping/Input/Flowlists/FEDEFLv1.0.3.csv",
+      "snapshot_file": "FEDEFLv1.0.3.csv",
+      "row_count": 278602
+    },
+    "IDEA_EFv2.3": {
+      "upstream_repo": "https://github.com/UNEP-Economy-Division/GLAD-ElementaryFlowResources",
+      "upstream_file": "Mapping/Input/Flowlists/IDEA_EFv2.3.csv",
+      "snapshot_file": "IDEA_EFv2.3.csv",
+      "row_count": 903
+    }
+  }
+}

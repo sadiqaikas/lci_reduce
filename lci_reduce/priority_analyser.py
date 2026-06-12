@@ -24,7 +24,6 @@ BASE_PRIORITY_COLUMNS = [
     "tau_entry_min",
     "tau_entry_median",
     "tau_entry_max",
-    "cf_status",
 ]
 
 RANKED_EXPORT_COLUMNS = [
@@ -44,7 +43,8 @@ RANKED_EXPORT_COLUMNS = [
     "cf_status",
 ]
 
-_ETA_COLUMN_RE = re.compile(r"^eta_(?P<token>[0-9A-Za-z_]+)$")
+_ETA_COLUMN_RE = re.compile(r"^eta_(?P<token>[0-9]+(?:_[0-9]+)*)$")
+_LOSS_MAX_COLUMN_RE = re.compile(r"^loss_max_(?P<token>[0-9]+(?:_[0-9]+)*)$")
 _EPSILON = 1e-12
 
 
@@ -96,6 +96,32 @@ class PriorityRecord:
     def loss_max(self, pair: TauColumnPair) -> float:
         return self.metrics[pair.token][1]
 
+    @property
+    def has_explicit_cf_status(self) -> bool:
+        return bool(self.cf_status)
+
+    @property
+    def effective_cf_status(self) -> str:
+        if self.cf_status:
+            return self.cf_status
+        if self.characterised_occurrence_count <= 0:
+            return "uncharacterised"
+        if self.characterised_occurrence_count < self.occurrence_count:
+            return "partly_characterised"
+        return "characterised"
+
+    @property
+    def display_cf_status(self) -> str:
+        if self.cf_status:
+            return self.cf_status
+        return f"{self.effective_cf_status} (derived)"
+
+    @property
+    def is_uncharacterised(self) -> bool:
+        if self.cf_status:
+            return self.cf_status == "uncharacterised"
+        return self.characterised_occurrence_count <= 0
+
 
 @dataclass
 class PriorityDataset:
@@ -137,6 +163,10 @@ class PriorityDataset:
 
     def has_tau(self, tau: float) -> bool:
         return _tau_key(tau) in self.tau_pairs_by_key
+
+    @property
+    def has_cf_status_column(self) -> bool:
+        return "cf_status" in self.fieldnames
 
 
 @dataclass
@@ -240,6 +270,10 @@ def load_priority_dataset(
                     raise PriorityAnalysisError(
                         f"Row {row_number} has a negative raw coverage loss in {pair.loss_max_column}."
                     )
+                if eta > loss_max + _EPSILON:
+                    raise PriorityAnalysisError(
+                        f"Row {row_number} has {pair.eta_column} greater than {pair.loss_max_column}."
+                    )
                 metrics[pair.token] = (max(eta, 0.0), max(loss_max, 0.0))
 
             rows.append(
@@ -265,7 +299,7 @@ def load_priority_dataset(
                         "tau_entry_median",
                     ),
                     tau_entry_max=_parse_optional_float(cleaned["tau_entry_max"], row_number, "tau_entry_max"),
-                    cf_status=cleaned["cf_status"],
+                    cf_status=cleaned.get("cf_status", ""),
                     metrics=metrics,
                 )
             )
@@ -298,11 +332,13 @@ def detect_tau_column_pairs(fieldnames: Sequence[str]) -> list[TauColumnPair]:
     eta_tokens: dict[str, str] = {}
     loss_tokens: set[str] = set()
     for field in fieldnames:
-        match = _ETA_COLUMN_RE.match(field)
-        if match:
-            eta_tokens[match.group("token")] = field
-        elif field.startswith("loss_max_"):
-            loss_tokens.add(field[len("loss_max_"):])
+        eta_match = _ETA_COLUMN_RE.match(field)
+        if eta_match:
+            eta_tokens[eta_match.group("token")] = field
+            continue
+        loss_match = _LOSS_MAX_COLUMN_RE.match(field)
+        if loss_match:
+            loss_tokens.add(loss_match.group("token"))
 
     all_tokens = sorted(set(eta_tokens) | loss_tokens)
     if not all_tokens:
@@ -339,9 +375,9 @@ def detect_tau_column_pairs(fieldnames: Sequence[str]) -> list[TauColumnPair]:
 def build_priority_overview(dataset: PriorityDataset) -> dict[str, Any]:
     overview = {
         "total_flows": len(dataset.rows),
-        "characterised_flows": sum(row.cf_status == "characterised" for row in dataset.rows),
-        "partly_characterised_flows": sum(row.cf_status == "partly_characterised" for row in dataset.rows),
-        "uncharacterised_flows": sum(row.cf_status == "uncharacterised" for row in dataset.rows),
+        "characterised_flows": sum(row.effective_cf_status == "characterised" for row in dataset.rows),
+        "partly_characterised_flows": sum(row.effective_cf_status == "partly_characterised" for row in dataset.rows),
+        "uncharacterised_flows": sum(row.is_uncharacterised for row in dataset.rows),
         "tau_metrics": {},
     }
     for pair in dataset.tau_pairs:
@@ -371,7 +407,7 @@ def filter_priority_rows(
     for row in dataset.rows:
         if search and search not in row.flow_id.casefold() and search not in row.flow_name.casefold():
             continue
-        if cf_status != "all" and row.cf_status != cf_status:
+        if cf_status != "all" and row.effective_cf_status != cf_status:
             continue
         if eta_positive_only and row.eta(pair) <= _EPSILON:
             continue
@@ -536,8 +572,12 @@ def analyse_selected_group(
 
     lower_bound = max(row.eta(pair) for row in rows)
     sum_loss_max = sum(row.loss_max(pair) for row in rows)
-    capped = sum_loss_max > pair.tau + _EPSILON
-    upper_bound = min(pair.tau, sum_loss_max)
+    anchor_upper_bound = min(
+        row.eta(pair) + (sum_loss_max - row.loss_max(pair))
+        for row in rows
+    )
+    capped = anchor_upper_bound > pair.tau + _EPSILON
+    upper_bound = min(pair.tau, anchor_upper_bound)
     exact_eta: float | None = None
     exact_reason: str | None = None
 
@@ -569,7 +609,10 @@ def analyse_selected_group(
     if exact_reason is not None:
         interpretation.append(exact_reason)
     if not interpretation:
-        interpretation.append("Compact-screen bound computed from the priority CSV. Review the numeric interval directly.")
+        interpretation.append(
+            "Compact-screen bound computed from the priority CSV using one selected flow's observed eta "
+            "plus loss_max for the remaining selected flows. Review the numeric interval directly."
+        )
 
     if exact_eta is not None:
         interval_text = f"Exact eta_F({pair.tau_label}) = {_format_metric(exact_eta)}."
@@ -578,7 +621,8 @@ def analyse_selected_group(
         upper_text = _format_metric(upper_bound)
         interval_text = (
             f"eta_F({pair.tau_label}) is bounded by [{lower_text}, {upper_text}]. "
-            "Compact-screen bound from the CSV."
+            "Compact-screen bound from the CSV using one selected flow's observed eta plus loss_max for the "
+            "remaining selected flows."
         )
     return GroupBoundResult(
         pair=pair,
@@ -615,7 +659,7 @@ def serialise_row(
         "tau_entry_max": row.tau_entry_max,
         "occurrence_count": row.occurrence_count,
         "characterised_occurrence_count": row.characterised_occurrence_count,
-        "cf_status": row.cf_status,
+        "cf_status": row.effective_cf_status,
         "selected_audit_tau": pair.tau,
         "eta_column": pair.eta_column,
         "loss_max_column": pair.loss_max_column,
@@ -644,6 +688,7 @@ def build_priority_summary(
         "schema_validation": {
             "status": "ok",
             "required_base_columns": list(BASE_PRIORITY_COLUMNS),
+            "legacy_optional_columns_present": [column for column in ["cf_status"] if column in dataset.fieldnames],
             "detected_tau_values": [item.tau for item in dataset.tau_pairs],
             "detected_tau_columns": [item.to_dict() for item in dataset.tau_pairs],
             "row_count": len(dataset.rows),

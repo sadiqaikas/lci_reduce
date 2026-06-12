@@ -39,6 +39,7 @@ class FlowInfo:
     location_region: Optional[str] = None
     reference_flow_property_id: Optional[str] = None
     reference_flow_property_name: Optional[str] = None
+    source_file: str = ""
 
 
 @dataclass
@@ -94,6 +95,21 @@ class ResolvedCharacterisationFactor:
 
 
 @dataclass
+class AdmissibleCharacterisationFactor:
+    candidate: CharacterisationFactorCandidate
+    conversion_factor: float = 1.0
+    unit_compatibility: Optional["UnitCompatibilityResult"] = None
+
+
+@dataclass
+class AdmissibleCharacterisationFactorSet:
+    options: List[AdmissibleCharacterisationFactor]
+    candidate_count: int
+    differing_fields: List[str]
+    ambiguity_key: str = ""
+
+
+@dataclass
 class CFAmbiguityRecord:
     severity: str
     method_id: str
@@ -120,6 +136,7 @@ class CFAmbiguityRecord:
     exchange_flow_property_name: str
     flow_reference_flow_property_id: str
     flow_reference_flow_property_name: str
+    flow_source_file: str
     source_file: str
     differing_fields: str
     message: str
@@ -131,7 +148,6 @@ class CFAmbiguityRecord:
     exchange_index: str = ""
     ambiguity_key: str = ""
     resolution_status: str = ""
-    choice_origin: str = ""
     occurrence_timestamp: str = ""
     all_candidate_cf_values: str = ""
     all_candidate_metadata: str = ""
@@ -187,6 +203,20 @@ class ImpactCategoryReport:
 
 
 @dataclass
+class CategoryPathDiagnostics:
+    n_category_objects_indexed: int = 0
+    n_category_identifier_aliases_indexed: int = 0
+    n_category_paths_resolved: int = 0
+    n_flows_with_category_reference: int = 0
+    n_flows_with_resolved_category_reference: int = 0
+    n_elementary_flows: int = 0
+    n_elementary_flows_with_category_path: int = 0
+    n_unresolved_elementary_flows: int = 0
+    pct_elementary_flows_with_category_path: float = 0.0
+    sample_unresolved_elementary_flows: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class JsonLdArchive:
     source_path: str
     source_name: str
@@ -198,6 +228,9 @@ class JsonLdArchive:
     impact_categories: Dict[str, ImpactCategory]
     impact_methods: Dict[str, DatasetEntry]
     other_entries: List[DatasetEntry]
+    category_path_diagnostics: CategoryPathDiagnostics = field(default_factory=CategoryPathDiagnostics)
+    source_format: str = "jsonld"
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -211,6 +244,9 @@ class JsonLdArchiveIndex:
     flows: Dict[str, FlowInfo]
     units: Dict[str, UnitInfo]
     impact_categories: Dict[str, ImpactCategory]
+    category_path_diagnostics: CategoryPathDiagnostics = field(default_factory=CategoryPathDiagnostics)
+    source_format: str = "jsonld"
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -232,29 +268,79 @@ class WarningRecord:
 
 
 @dataclass
+class CFAmbiguityStats:
+    n_exact_cf_resolutions: int = 0
+    n_finite_cf_candidate_sets: int = 0
+    n_scenario_rows_added: int = 0
+    n_regional_scenario_groups: int = 0
+    n_independent_candidate_groups: int = 0
+    n_unresolved_cf_ambiguities: int = 0
+    max_candidate_set_size: int = 0
+
+    def merge(self, other: "CFAmbiguityStats") -> None:
+        self.n_exact_cf_resolutions += other.n_exact_cf_resolutions
+        self.n_finite_cf_candidate_sets += other.n_finite_cf_candidate_sets
+        self.n_scenario_rows_added += other.n_scenario_rows_added
+        self.n_regional_scenario_groups += other.n_regional_scenario_groups
+        self.n_independent_candidate_groups += other.n_independent_candidate_groups
+        self.n_unresolved_cf_ambiguities += other.n_unresolved_cf_ambiguities
+        self.max_candidate_set_size = max(self.max_candidate_set_size, other.max_candidate_set_size)
+
+
+@dataclass
+class CoverageRowMetadata:
+    row_id: str
+    category_id: str
+    category_name: str
+    scenario_id: str
+    scenario_label: str
+    scenario_type: str
+
+
+@dataclass
 class ProcessReductionResult:
     process_id: str
     process_name: str
-    process_path: str
-    original_process: Dict[str, Any]
-    reduced_process: Dict[str, Any]
-    selected_mask: np.ndarray
-    selected_pos_mask: np.ndarray
-    selected_neg_mask: np.ndarray
-    candidate_indices: List[int]
-    kept_indices: List[int]
-    removed_indices: List[int]
-    elementary_rows: List[Dict[str, Any]]
-    process_row: Dict[str, Any]
-    full_pos: np.ndarray
-    full_neg: np.ndarray
-    retained_pos: np.ndarray
-    retained_neg: np.ndarray
-    active_pos: np.ndarray
-    active_neg: np.ndarray
+    process_path: str = ""
+    original_process: Optional[Dict[str, Any]] = None
+    reduced_process: Dict[str, Any] = field(default_factory=dict)
+    selected_mask: Optional[np.ndarray] = None
+    selected_pos_mask: Optional[np.ndarray] = None
+    selected_neg_mask: Optional[np.ndarray] = None
+    candidate_indices: List[int] = field(default_factory=list)
+    kept_indices: List[int] = field(default_factory=list)
+    removed_indices: List[int] = field(default_factory=list)
+    elementary_rows: List[Dict[str, Any]] = field(default_factory=list)
+    process_row: Dict[str, Any] = field(default_factory=dict)
+    full_pos: Optional[np.ndarray] = None
+    full_neg: Optional[np.ndarray] = None
+    retained_pos: Optional[np.ndarray] = None
+    retained_neg: Optional[np.ndarray] = None
+    active_pos: Optional[np.ndarray] = None
+    active_neg: Optional[np.ndarray] = None
     n_uncharacterised_kept: int = 0
     n_uncharacterised_removed: int = 0
+    cf_ambiguity_stats: CFAmbiguityStats = field(default_factory=CFAmbiguityStats)
     warnings: List[WarningRecord] = field(default_factory=list)
+
+
+@dataclass
+class AmbiguityExploreConfig:
+    database: str
+    methods: Optional[str]
+    output_dir: str
+    method_selection: str
+    strict_units: bool
+    tolerance: float
+    allow_water_mass_volume_override: bool = False
+    max_processes: int = 100
+
+
+@dataclass
+class AmbiguityExploreResult:
+    cf_ambiguities_csv: str
+    cf_ambiguity_metadata_json: str
+    metadata: Dict[str, Any]
 
 
 @dataclass
@@ -285,16 +371,20 @@ class CreateConfig:
     uncharacterised_policy: str
     strict_units: bool
     tolerance: float
-    cf_resolution_file: Optional[str] = None
+    allow_water_mass_volume_override: bool = False
+    max_scenario_rows_per_process: int = 300000
+    max_candidate_set_size: int = 500
+    fail_fast: bool = True
 
 
 @dataclass
 class CreateResult:
     output_zip: str
-    exchange_manifest_csv: str
-    process_manifest_csv: str
     run_summary_json: str
+    reduction_debug_ndjson: str
     summary: Dict[str, Any]
+    exchange_manifest_csv: str = ""
+    process_manifest_csv: str = ""
 
 
 @dataclass
@@ -306,7 +396,9 @@ class FlowPriorityConfig:
     audit_tau_values: List[float]
     strict_units: bool
     tolerance: float
-    cf_resolution_file: Optional[str] = None
+    allow_water_mass_volume_override: bool = False
+    max_scenario_rows_per_process: int = 300000
+    max_candidate_set_size: int = 1000
 
 
 @dataclass

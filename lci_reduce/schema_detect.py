@@ -7,18 +7,54 @@ from typing import Any, Dict, Optional
 
 PROCESS_TYPES = {"process"}
 FLOW_TYPES = {"flow"}
+FLOW_PROPERTY_TYPES = {"flowproperty", "flow_property"}
 UNIT_TYPES = {"unit"}
 UNIT_GROUP_TYPES = {"unitgroup", "unit_group"}
 IMPACT_CATEGORY_TYPES = {"impactcategory", "lciacategory"}
 IMPACT_METHOD_TYPES = {"impactmethod", "lciamethod"}
 CATEGORY_TYPES = {"category"}
+TOP_LEVEL_OBJECT_TYPES = {
+    "processes": "process",
+    "flows": "flow",
+    "flow_properties": "flow_property",
+    "flowproperties": "flow_property",
+    "categories": "category",
+    "category": "category",
+    "flow_categories": "category",
+    "flowcategories": "category",
+    "units": "unit",
+    "unit_groups": "unit_group",
+    "unitgroups": "unit_group",
+    "lcia_methods": "impact_method",
+    "impact_methods": "impact_method",
+    "lcia_categories": "impact_category",
+    "impact_categories": "impact_category",
+}
+NON_DATASET_TOP_LEVEL_SEGMENTS = {"bin"}
+RECOGNISED_COLLECTION_SEGMENTS = set(TOP_LEVEL_OBJECT_TYPES) | NON_DATASET_TOP_LEVEL_SEGMENTS
 
 
 def _normalise_token(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum() or ch == "_")
 
 
-def detect_object_type(data: Dict[str, Any], path: str) -> str:
+def _path_segments(path: str) -> list[str]:
+    parts = [part.strip() for part in path.replace("\\", "/").split("/") if part.strip()]
+    return [part.casefold() for part in parts]
+
+
+def _collection_segment(path: str) -> str:
+    parts = _path_segments(path)
+    if not parts:
+        return ""
+    if parts[0] in RECOGNISED_COLLECTION_SEGMENTS:
+        return parts[0]
+    if len(parts) >= 2 and parts[1] in RECOGNISED_COLLECTION_SEGMENTS:
+        return parts[1]
+    return parts[0]
+
+
+def _explicit_object_type(data: Dict[str, Any]) -> str:
     candidates = [
         data.get("@type"),
         data.get("type"),
@@ -31,6 +67,8 @@ def detect_object_type(data: Dict[str, Any], path: str) -> str:
                 return "process"
             if token in FLOW_TYPES:
                 return "flow"
+            if token in FLOW_PROPERTY_TYPES:
+                return "flow_property"
             if token in UNIT_TYPES:
                 return "unit"
             if token in UNIT_GROUP_TYPES:
@@ -41,21 +79,21 @@ def detect_object_type(data: Dict[str, Any], path: str) -> str:
                 return "impact_method"
             if token in CATEGORY_TYPES:
                 return "category"
-    lower_path = path.lower()
-    if "/process" in lower_path or lower_path.startswith("process"):
-        return "process"
-    if "/flow" in lower_path or lower_path.startswith("flow"):
-        return "flow"
-    if "/categories/" in lower_path or lower_path.startswith("categories/"):
-        return "category"
-    if "/unit_group" in lower_path or "/unitgroups" in lower_path:
-        return "unit_group"
-    if "/unit" in lower_path or lower_path.startswith("unit"):
-        return "unit"
-    if "/lcia_method" in lower_path or "/impact_method" in lower_path:
-        return "impact_method"
-    if "/lcia_categor" in lower_path or "/impact_categor" in lower_path:
-        return "impact_category"
+    return ""
+
+
+def detect_object_type(data: Dict[str, Any], path: str) -> str:
+    explicit_type = _explicit_object_type(data)
+    collection = _collection_segment(path)
+    path_type = TOP_LEVEL_OBJECT_TYPES.get(collection, "")
+    if explicit_type:
+        if collection in NON_DATASET_TOP_LEVEL_SEGMENTS:
+            return "other"
+        if path_type and path_type != explicit_type:
+            return "other"
+        return explicit_type
+    if path_type:
+        return path_type
     return "other"
 
 
@@ -98,22 +136,33 @@ def reference_name(ref: Any) -> str:
     return ""
 
 
+
+
 def category_path_text(data: Dict[str, Any]) -> str:
     category = data.get("category")
+
+    if isinstance(category, str) and category.strip():
+        return category.strip()
+
     if isinstance(category, dict):
-        if isinstance(category.get("path"), str):
-            return category["path"]
-        if isinstance(category.get("name"), str):
-            return category["name"]
-    if isinstance(data.get("categoryPath"), str):
-        return data["categoryPath"]
+        if isinstance(category.get("path"), str) and category["path"].strip():
+            return category["path"].strip()
+        if isinstance(category.get("categoryPath"), str) and category["categoryPath"].strip():
+            return category["categoryPath"].strip()
+        if isinstance(category.get("name"), str) and category["name"].strip():
+            return category["name"].strip()
+
+    if isinstance(data.get("categoryPath"), str) and data["categoryPath"].strip():
+        return data["categoryPath"].strip()
+
     categories = data.get("categories")
     if isinstance(categories, list):
         tokens = []
         for item in categories:
-            if isinstance(item, str):
-                tokens.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("name"), str):
-                tokens.append(item["name"])
+            if isinstance(item, str) and item.strip():
+                tokens.append(item.strip())
+            elif isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"].strip():
+                tokens.append(item["name"].strip())
         return "/".join(tokens)
+
     return ""

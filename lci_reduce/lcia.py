@@ -16,10 +16,12 @@ from .errors import (
     AmbiguousCharacterisationFactorError,
     DataFormatError,
     DuplicateMethodConflictError,
-    RunCancelledError,
+    ScenarioExpansionError,
     UnitCompatibilityError,
 )
 from .models import (
+    AdmissibleCharacterisationFactor,
+    AdmissibleCharacterisationFactorSet,
     CFAmbiguityRecord,
     CharacterisationFactorCandidate,
     CharacterizationFactor,
@@ -384,7 +386,6 @@ def _append_cf_records(
     exchange_index: int | None = None,
     ambiguity_key: str = "",
     resolution_status: str = "",
-    choice_origin: str = "",
     occurrence_timestamp: str = "",
     chosen_candidate: Optional[CharacterisationFactorCandidate] = None,
 ) -> None:
@@ -458,6 +459,7 @@ def _append_cf_records(
                     else (flow.reference_flow_property_name if flow else "")
                 )
                 or "",
+                flow_source_file=(flow.source_file if flow else "") or "",
                 source_file=candidate.source_file,
                 differing_fields=differing,
                 message=message,
@@ -469,7 +471,6 @@ def _append_cf_records(
                 exchange_index="" if exchange_index is None else str(exchange_index),
                 ambiguity_key=ambiguity_key,
                 resolution_status=resolution_status,
-                choice_origin=choice_origin,
                 occurrence_timestamp=occurrence_timestamp,
                 all_candidate_cf_values=all_candidate_values,
                 all_candidate_metadata=all_candidate_metadata,
@@ -627,12 +628,31 @@ def _compare_flow_property_identity(
 def _unit_conversion_factor(
     exchange_unit_id: Optional[str],
     cf_unit_id: Optional[str],
+    exchange_unit_name: Optional[str],
+    cf_unit_name: Optional[str],
     unit_registry: Dict[str, UnitInfo],
 ) -> Optional[float]:
-    if not exchange_unit_id or not cf_unit_id:
-        return None
-    exchange_unit_info = unit_registry.get(exchange_unit_id)
-    cf_unit_info = unit_registry.get(cf_unit_id)
+    def resolve_unit(unit_id: Optional[str], unit_name: Optional[str]) -> Optional[UnitInfo]:
+        if unit_id:
+            unit_info = unit_registry.get(unit_id)
+            if unit_info is not None:
+                return unit_info
+        if not unit_name:
+            return None
+        token = normalise_unit(unit_name)
+        if token is None:
+            return None
+        matches = [
+            info
+            for info in unit_registry.values()
+            if normalise_unit(info.name) == token
+        ]
+        if len(matches) != 1:
+            return None
+        return matches[0]
+
+    exchange_unit_info = resolve_unit(exchange_unit_id, exchange_unit_name)
+    cf_unit_info = resolve_unit(cf_unit_id, cf_unit_name)
     if exchange_unit_info is None or cf_unit_info is None:
         return None
     if not exchange_unit_info.group_id or exchange_unit_info.group_id != cf_unit_info.group_id:
@@ -642,6 +662,302 @@ def _unit_conversion_factor(
     return float(exchange_unit_info.conversion_factor) / float(cf_unit_info.conversion_factor)
 
 
+
+
+def _flow_property_factor_from_flow(
+    flow: FlowInfo,
+    property_id: Optional[str],
+    property_name: Optional[str],
+) -> Optional[float]:
+    for item in flow.raw.get("flowProperties", []) or []:
+        if not isinstance(item, dict):
+            continue
+
+        prop = item.get("flowProperty")
+        prop_id = reference_id(prop)
+        prop_name = extract_name(prop)
+
+        id_match = property_id and prop_id and str(property_id) == str(prop_id)
+        name_match = property_name and prop_name and normalise_text(property_name) == normalise_text(prop_name)
+
+        if not (id_match or name_match):
+            continue
+
+        factor = item.get("conversionFactor")
+        if factor is None:
+            continue
+
+        factor = float(factor)
+        if factor > 0:
+            return factor
+
+    return None
+
+
+_WATER_MASS_UNIT_NAMES = {
+    "kg",
+    "kilogram",
+    "kilograms",
+}
+
+_WATER_VOLUME_UNIT_NAMES = {
+    "m3",
+    "m^3",
+    "m³",
+    "cubic meter",
+    "cubic meters",
+    "cubic metre",
+    "cubic metres",
+}
+
+_CANONICAL_NAMED_UNIT_FAMILIES = {
+    "mass": {
+        "kg": 1.0,
+        "kilogram": 1.0,
+        "kilograms": 1.0,
+        "g": 0.001,
+        "gram": 0.001,
+        "grams": 0.001,
+        "mg": 1e-6,
+        "milligram": 1e-6,
+        "milligrams": 1e-6,
+        "ug": 1e-9,
+        "µg": 1e-9,
+        "μg": 1e-9,
+        "microgram": 1e-9,
+        "micrograms": 1e-9,
+        "t": 1000.0,
+        "tonne": 1000.0,
+        "tonnes": 1000.0,
+        "metric ton": 1000.0,
+        "metric tons": 1000.0,
+        "metric tonne": 1000.0,
+        "metric tonnes": 1000.0,
+    },
+    "activity": {
+        "bq": 1.0,
+        "becquerel": 1.0,
+        "becquerels": 1.0,
+        "kbq": 1e3,
+        "kilobecquerel": 1e3,
+        "kilobecquerels": 1e3,
+        "mbq": 1e6,
+        "megabecquerel": 1e6,
+        "megabecquerels": 1e6,
+        "gbq": 1e9,
+        "gigabecquerel": 1e9,
+        "gigabecquerels": 1e9,
+        "tbq": 1e12,
+        "terabecquerel": 1e12,
+        "terabecquerels": 1e12,
+    },
+    "volume": {
+        "m3": 1.0,
+        "m^3": 1.0,
+        "m³": 1.0,
+        "cubic meter": 1.0,
+        "cubic meters": 1.0,
+        "cubic metre": 1.0,
+        "cubic metres": 1.0,
+        "l": 0.001,
+        "liter": 0.001,
+        "liters": 0.001,
+        "litre": 0.001,
+        "litres": 0.001,
+        "ml": 1e-6,
+        "milliliter": 1e-6,
+        "milliliters": 1e-6,
+        "millilitre": 1e-6,
+        "millilitres": 1e-6,
+        "cm3": 1e-6,
+        "cm^3": 1e-6,
+        "cm³": 1e-6,
+        "cubic centimeter": 1e-6,
+        "cubic centimeters": 1e-6,
+        "cubic centimetre": 1e-6,
+        "cubic centimetres": 1e-6,
+    },
+    "energy": {
+        "j": 1.0,
+        "joule": 1.0,
+        "joules": 1.0,
+        "kj": 1e3,
+        "kilojoule": 1e3,
+        "kilojoules": 1e3,
+        "mj": 1e6,
+        "megajoule": 1e6,
+        "megajoules": 1e6,
+        "gj": 1e9,
+        "gigajoule": 1e9,
+        "gigajoules": 1e9,
+        "wh": 3600.0,
+        "watt hour": 3600.0,
+        "watt hours": 3600.0,
+        "kwh": 3.6e6,
+        "kilowatt hour": 3.6e6,
+        "kilowatt hours": 3.6e6,
+        "mwh": 3.6e9,
+        "megawatt hour": 3.6e9,
+        "megawatt hours": 3.6e9,
+    },
+    "length": {
+        "m": 1.0,
+        "meter": 1.0,
+        "meters": 1.0,
+        "metre": 1.0,
+        "metres": 1.0,
+        "cm": 0.01,
+        "centimeter": 0.01,
+        "centimeters": 0.01,
+        "centimetre": 0.01,
+        "centimetres": 0.01,
+        "mm": 0.001,
+        "millimeter": 0.001,
+        "millimeters": 0.001,
+        "millimetre": 0.001,
+        "millimetres": 0.001,
+        "km": 1000.0,
+        "kilometer": 1000.0,
+        "kilometers": 1000.0,
+        "kilometre": 1000.0,
+        "kilometres": 1000.0,
+    },
+    "area": {
+        "m2": 1.0,
+        "m^2": 1.0,
+        "m²": 1.0,
+        "square meter": 1.0,
+        "square meters": 1.0,
+        "square metre": 1.0,
+        "square metres": 1.0,
+        "cm2": 1e-4,
+        "cm^2": 1e-4,
+        "cm²": 1e-4,
+        "square centimeter": 1e-4,
+        "square centimeters": 1e-4,
+        "square centimetre": 1e-4,
+        "square centimetres": 1e-4,
+        "mm2": 1e-6,
+        "mm^2": 1e-6,
+        "mm²": 1e-6,
+        "square millimeter": 1e-6,
+        "square millimeters": 1e-6,
+        "square millimetre": 1e-6,
+        "square millimetres": 1e-6,
+        "ha": 1e4,
+        "hectare": 1e4,
+        "hectares": 1e4,
+        "km2": 1e6,
+        "km^2": 1e6,
+        "km²": 1e6,
+        "square kilometer": 1e6,
+        "square kilometers": 1e6,
+        "square kilometre": 1e6,
+        "square kilometres": 1e6,
+    },
+    "amount_of_substance": {
+        "mol": 1.0,
+        "mole": 1.0,
+        "moles": 1.0,
+        "mmol": 1e-3,
+        "millimole": 1e-3,
+        "millimoles": 1e-3,
+        "umol": 1e-6,
+        "µmol": 1e-6,
+        "μmol": 1e-6,
+        "micromole": 1e-6,
+        "micromoles": 1e-6,
+        "kmol": 1e3,
+        "kilomole": 1e3,
+        "kilomoles": 1e3,
+    },
+}
+
+
+def _build_canonical_named_unit_index() -> Dict[str, Tuple[str, float]]:
+    index: Dict[str, Tuple[str, float]] = {}
+    ambiguous_tokens: set[str] = set()
+    for family, units in _CANONICAL_NAMED_UNIT_FAMILIES.items():
+        for raw_name, factor in units.items():
+            token = normalise_unit(raw_name)
+            if token is None:
+                continue
+            entry = (family, float(factor))
+            existing = index.get(token)
+            if existing is not None and existing != entry:
+                ambiguous_tokens.add(token)
+                continue
+            index[token] = entry
+    for token in ambiguous_tokens:
+        index.pop(token, None)
+    return index
+
+
+_CANONICAL_NAMED_UNIT_INDEX = _build_canonical_named_unit_index()
+
+
+def _resolved_unit_name(
+    unit_id: Optional[str],
+    unit_name: Optional[str],
+    unit_registry: Dict[str, UnitInfo],
+) -> Optional[str]:
+    if unit_name:
+        return normalise_unit(unit_name)
+    if unit_id and unit_id in unit_registry:
+        return normalise_unit(unit_registry[unit_id].name)
+    return None
+
+
+def _named_canonical_unit_conversion(
+    *,
+    exchange_unit_id: Optional[str],
+    exchange_unit_name: Optional[str],
+    cf_unit_id: Optional[str],
+    cf_unit_name: Optional[str],
+    unit_registry: Dict[str, UnitInfo],
+) -> Optional[Tuple[str, float]]:
+    exchange_name = _resolved_unit_name(exchange_unit_id, exchange_unit_name, unit_registry)
+    cf_name = _resolved_unit_name(cf_unit_id, cf_unit_name, unit_registry)
+    if exchange_name is None or cf_name is None:
+        return None
+    exchange_entry = _CANONICAL_NAMED_UNIT_INDEX.get(exchange_name)
+    cf_entry = _CANONICAL_NAMED_UNIT_INDEX.get(cf_name)
+    if exchange_entry is None or cf_entry is None:
+        return None
+    exchange_family, exchange_factor = exchange_entry
+    cf_family, cf_factor = cf_entry
+    if exchange_family != cf_family:
+        return None
+    return exchange_family, exchange_factor / cf_factor
+
+
+def _water_override_conversion_factor(
+    *,
+    flow: FlowInfo,
+    exchange_unit_id: Optional[str],
+    exchange_unit_name: Optional[str],
+    cf_unit_id: Optional[str],
+    cf_unit_name: Optional[str],
+    unit_registry: Dict[str, UnitInfo],
+) -> Optional[float]:
+    if normalise_text(flow.name) != "water":
+        return None
+
+    exchange_name = _resolved_unit_name(exchange_unit_id, exchange_unit_name, unit_registry)
+    cf_name = _resolved_unit_name(cf_unit_id, cf_unit_name, unit_registry)
+    if exchange_name is None or cf_name is None:
+        return None
+
+    if exchange_name in _WATER_MASS_UNIT_NAMES and cf_name in _WATER_VOLUME_UNIT_NAMES:
+        return 0.001
+    if exchange_name in _WATER_VOLUME_UNIT_NAMES and cf_name in _WATER_MASS_UNIT_NAMES:
+        return 1000.0
+    return None
+
+
+
+
+
 def check_unit_compatibility(
     exchange_unit: Optional[dict],
     exchange_flow_property: Optional[dict],
@@ -649,6 +965,7 @@ def check_unit_compatibility(
     cf_candidate: CharacterisationFactorCandidate,
     unit_registry: Dict[str, UnitInfo],
     strict_units: bool = True,
+    allow_water_mass_volume_override: bool = False,
 ) -> UnitCompatibilityResult:
     del strict_units
     exchange_unit_id = reference_id(exchange_unit)
@@ -687,6 +1004,50 @@ def check_unit_compatibility(
                 effective_cf_flow_property_id,
                 effective_cf_flow_property_name,
             ):
+                exchange_property_factor = _flow_property_factor_from_flow(
+                    flow,
+                    effective_exchange_flow_property_id,
+                    effective_exchange_flow_property_name,
+                )
+                cf_property_factor = _flow_property_factor_from_flow(
+                    flow,
+                    effective_cf_flow_property_id,
+                    effective_cf_flow_property_name,
+                )
+
+                if (
+                    exchange_property_factor is not None
+                    and cf_property_factor is not None
+                    and exchange_unit_info is not None
+                    and cf_unit_info is not None
+                    and exchange_unit_info.conversion_factor is not None
+                    and cf_unit_info.conversion_factor is not None
+                ):
+                    conversion_factor = (
+                        float(exchange_unit_info.conversion_factor)
+                        * float(cf_property_factor)
+                        / float(exchange_property_factor)
+                        / float(cf_unit_info.conversion_factor)
+                    )
+
+                    return UnitCompatibilityResult(
+                        compatible=True,
+                        conversion_factor=conversion_factor,
+                        reason="flow_property_conversion",
+                        exchange_unit_id=exchange_unit_id,
+                        exchange_unit_name=exchange_unit_name or None,
+                        exchange_flow_property_id=effective_exchange_flow_property_id,
+                        exchange_flow_property_name=effective_exchange_flow_property_name,
+                        flow_reference_flow_property_id=flow_reference_flow_property_id,
+                        flow_reference_flow_property_name=flow_reference_flow_property_name,
+                        cf_unit_id=cf_candidate.cf_unit_id,
+                        cf_unit_name=cf_candidate.cf_unit,
+                        cf_flow_property_id=effective_cf_flow_property_id,
+                        cf_flow_property_name=effective_cf_flow_property_name,
+                        flow_property_id=effective_cf_flow_property_id,
+                        flow_property_name=effective_cf_flow_property_name,
+                    )
+
                 return UnitCompatibilityResult(
                     compatible=False,
                     conversion_factor=0.0,
@@ -704,7 +1065,6 @@ def check_unit_compatibility(
                     flow_property_id=effective_cf_flow_property_id or effective_exchange_flow_property_id,
                     flow_property_name=effective_cf_flow_property_name or effective_exchange_flow_property_name,
                 )
-
     if exchange_unit_id and cf_candidate.cf_unit_id and exchange_unit_id == cf_candidate.cf_unit_id:
         return UnitCompatibilityResult(
             compatible=True,
@@ -762,7 +1122,13 @@ def check_unit_compatibility(
             flow_property_name=effective_cf_flow_property_name or effective_exchange_flow_property_name,
         )
 
-    conversion_factor = _unit_conversion_factor(exchange_unit_id, cf_candidate.cf_unit_id, unit_registry)
+    conversion_factor = _unit_conversion_factor(
+        exchange_unit_id,
+        cf_candidate.cf_unit_id,
+        exchange_unit_name,
+        cf_candidate.cf_unit,
+        unit_registry,
+    )
     if conversion_factor is not None:
         return UnitCompatibilityResult(
             compatible=True,
@@ -781,6 +1147,61 @@ def check_unit_compatibility(
             flow_property_id=effective_cf_flow_property_id or effective_exchange_flow_property_id,
             flow_property_name=effective_cf_flow_property_name or effective_exchange_flow_property_name,
         )
+
+    canonical_named_conversion = _named_canonical_unit_conversion(
+        exchange_unit_id=exchange_unit_id,
+        exchange_unit_name=exchange_unit_name,
+        cf_unit_id=cf_candidate.cf_unit_id,
+        cf_unit_name=cf_candidate.cf_unit,
+        unit_registry=unit_registry,
+    )
+    if canonical_named_conversion is not None:
+        family, conversion_factor = canonical_named_conversion
+        return UnitCompatibilityResult(
+            compatible=True,
+            conversion_factor=conversion_factor,
+            reason=f"named_{family}_unit_conversion",
+            exchange_unit_id=exchange_unit_id,
+            exchange_unit_name=exchange_unit_name or None,
+            exchange_flow_property_id=effective_exchange_flow_property_id,
+            exchange_flow_property_name=effective_exchange_flow_property_name,
+            flow_reference_flow_property_id=flow_reference_flow_property_id,
+            flow_reference_flow_property_name=flow_reference_flow_property_name,
+            cf_unit_id=cf_candidate.cf_unit_id,
+            cf_unit_name=cf_candidate.cf_unit,
+            cf_flow_property_id=effective_cf_flow_property_id,
+            cf_flow_property_name=effective_cf_flow_property_name,
+            flow_property_id=effective_cf_flow_property_id or effective_exchange_flow_property_id,
+            flow_property_name=effective_cf_flow_property_name or effective_exchange_flow_property_name,
+        )
+
+    if allow_water_mass_volume_override:
+        conversion_factor = _water_override_conversion_factor(
+            flow=flow,
+            exchange_unit_id=exchange_unit_id,
+            exchange_unit_name=exchange_unit_name,
+            cf_unit_id=cf_candidate.cf_unit_id,
+            cf_unit_name=cf_candidate.cf_unit,
+            unit_registry=unit_registry,
+        )
+        if conversion_factor is not None:
+            return UnitCompatibilityResult(
+                compatible=True,
+                conversion_factor=conversion_factor,
+                reason="water_mass_volume_override",
+                exchange_unit_id=exchange_unit_id,
+                exchange_unit_name=exchange_unit_name or None,
+                exchange_flow_property_id=effective_exchange_flow_property_id,
+                exchange_flow_property_name=effective_exchange_flow_property_name,
+                flow_reference_flow_property_id=flow_reference_flow_property_id,
+                flow_reference_flow_property_name=flow_reference_flow_property_name,
+                cf_unit_id=cf_candidate.cf_unit_id,
+                cf_unit_name=cf_candidate.cf_unit,
+                cf_flow_property_id=effective_cf_flow_property_id,
+                cf_flow_property_name=effective_cf_flow_property_name,
+                flow_property_id=effective_cf_flow_property_id or effective_exchange_flow_property_id,
+                flow_property_name=effective_cf_flow_property_name or effective_exchange_flow_property_name,
+            )
 
     return UnitCompatibilityResult(
         compatible=False,
@@ -883,6 +1304,40 @@ def _append_resolution_warning(
     )
 
 
+def _append_water_override_warning(
+    *,
+    category: ImpactCategory,
+    flow: FlowInfo,
+    process_id: str,
+    process_name: str,
+    warning_records: Optional[List[WarningRecord]],
+    exchange_unit_name: Optional[str],
+    cf_unit_name: Optional[str],
+) -> None:
+    if warning_records is None:
+        return
+    warning_records.append(
+        WarningRecord(
+            severity="warning",
+            object_type="unit_override",
+            object_id=category.category_id,
+            object_name=category.name,
+            process_id=process_id,
+            process_name=process_name,
+            flow_id=flow.flow_id,
+            flow_name=flow.name,
+            category_id=category.category_id,
+            category_name=category.name,
+            method_id=category.method_id or "",
+            method_name=category.method_name or "",
+            message=(
+                "Applied explicit water-only mass/volume override (1 kg = 0.001 m3); "
+                f"exchange_unit={exchange_unit_name or ''}; cf_unit={cf_unit_name or ''}"
+            ),
+        )
+    )
+
+
 def _location_match_score(
     candidate: CharacterisationFactorCandidate,
     context_keys: Sequence[str],
@@ -905,6 +1360,7 @@ def _prefer_compatible_candidate(
         "direct_unit_id_match": 4,
         "direct_unit_name_match": 3,
         "unit_group_conversion": 2,
+        "named_mass_unit_conversion": 2,
         "no_units_present": 1,
     }
 
@@ -918,9 +1374,12 @@ def _prefer_compatible_candidate(
             result.cf_flow_property_name,
         ):
             explicit_flow_property_match = 1
+        unit_rank = unit_reason_rank.get(result.reason, 0)
+        if result.reason.startswith("named_") and result.reason.endswith("_unit_conversion"):
+            unit_rank = max(unit_rank, 2)
         score = (
             explicit_flow_property_match,
-            unit_reason_rank.get(result.reason, 0),
+            unit_rank,
         )
         scored.append((score, candidate, result))
 
@@ -939,13 +1398,14 @@ def _prefer_compatible_candidate(
     return winners[0][1], winners[0][2], reason
 
 
-def resolve_cf_for_exchange(
+def resolve_admissible_cf_set_for_exchange(
     category: ImpactCategory,
     exchange: dict,
     flow: FlowInfo,
     candidates: Sequence[CharacterisationFactorCandidate],
     unit_registry: Dict[str, UnitInfo],
     strict_units: bool = True,
+    allow_water_mass_volume_override: bool = False,
     strict: bool = True,
     *,
     exchange_index: int = -1,
@@ -954,6 +1414,441 @@ def resolve_cf_for_exchange(
     ambiguity_records: Optional[List[CFAmbiguityRecord]] = None,
     diagnostic_file: str = "",
     resolution_manager: Optional[CFResolutionManager] = None,
+    record_only: bool = False,
+) -> Optional[AdmissibleCharacterisationFactorSet]:
+    if not candidates:
+        return None
+
+    process_id = str((process_data or {}).get("@id") or (process_data or {}).get("id") or "")
+    process_name = str((process_data or {}).get("name") or "")
+    exchange_id = _exchange_id(exchange)
+    exchange_unit_payload = exchange.get("unit") or exchange.get("referenceUnit")
+    if exchange_unit_payload is None and _extract_exchange_unit_name(exchange):
+        exchange_unit_payload = {"name": _extract_exchange_unit_name(exchange)}
+    exchange_flow_property_id, exchange_flow_property_name = _extract_exchange_flow_property(exchange)
+    exchange_flow_property_payload = None
+    if exchange_flow_property_id or exchange_flow_property_name:
+        exchange_flow_property_payload = {
+            "@id": exchange_flow_property_id,
+            "name": exchange_flow_property_name,
+        }
+
+    ambiguity_seen = len(candidates) > 1
+    deduplicated = deduplicate_exact_cf_candidates(candidates, ambiguity_records=ambiguity_records)
+    differing_fields = _differing_fields(deduplicated)
+    ambiguity_context: Optional[CFAmbiguityContext] = None
+    ambiguity_key = ""
+    if ambiguity_seen and resolution_manager is not None:
+        ambiguity_context = CFAmbiguityContext(
+            category_id=category.category_id,
+            category_name=category.name,
+            method_id=category.method_id or "",
+            method_name=category.method_name or "",
+            flow_id=flow.flow_id,
+            flow_name=flow.name,
+            process_id=process_id,
+            process_name=process_name,
+            exchange_id=exchange_id,
+            exchange_index=exchange_index,
+            diagnostic_file=diagnostic_file or "cf_ambiguities.csv",
+            differing_fields=list(differing_fields),
+        )
+        ambiguity_key = cf_ambiguity_key(ambiguity_context)
+        resolution_manager.note_found(ambiguity_key)
+
+    remaining = list(deduplicated)
+    resolution_source = ""
+    resolution_reason = ""
+    resolution_candidates: Sequence[CharacterisationFactorCandidate] = []
+    flow_compartment, flow_subcompartment = _flow_compartments(flow)
+    if ambiguity_seen and len(deduplicated) == 1:
+        resolution_source = "automatic"
+        resolution_reason = "Collapsed exact duplicate CF candidates with identical values and metadata."
+        resolution_candidates = list(candidates)
+
+    if any(field in differing_fields for field in ("cf_compartment", "cf_subcompartment")):
+        if not flow_compartment and strict:
+            message = (
+                "Unable to disambiguate compartment-specific characterisation factors because the flow lacks "
+                "reliable compartment metadata; "
+                + _error_message(
+                    category=category,
+                    flow=flow,
+                    process_id=process_id,
+                    process_name=process_name,
+                    candidates=remaining,
+                    differing_fields=differing_fields,
+                    diagnostic_file=diagnostic_file,
+                )
+            )
+            _append_cf_records(
+                remaining,
+                severity="error",
+                issue_type="ambiguity_failure",
+                group_key=f"ambiguity:{category.category_id}:{flow.flow_id}:{process_id}:compartment",
+                message=message,
+                differing_fields=differing_fields,
+                ambiguity_records=ambiguity_records,
+                process_id=process_id,
+                process_name=process_name,
+                exchange_id=exchange_id,
+                exchange_index=exchange_index,
+                ambiguity_key=ambiguity_key,
+            )
+            if warning_records is not None:
+                warning_records.append(
+                    _warning_record(
+                        severity="error",
+                        category=category,
+                        flow=flow,
+                        process_id=process_id,
+                        process_name=process_name,
+                        message=message,
+                    )
+                )
+            if resolution_manager is not None:
+                resolution_manager.summary.n_cf_ambiguities_unresolved += 1
+            if record_only:
+                return None
+            raise AmbiguousCharacterisationFactorError(message)
+        prior_remaining = list(remaining)
+        compartment_matches = []
+        for candidate in remaining:
+            if _normalise_optional(candidate.cf_compartment) != _normalise_optional(flow_compartment):
+                continue
+            if candidate.cf_subcompartment and _normalise_optional(candidate.cf_subcompartment) != _normalise_optional(flow_subcompartment):
+                continue
+            if candidate.cf_compartment:
+                compartment_matches.append(candidate)
+        if flow_subcompartment:
+            exact_subcompartment_matches = [
+                candidate
+                for candidate in compartment_matches
+                if candidate.cf_subcompartment
+                and _normalise_optional(candidate.cf_subcompartment) == _normalise_optional(flow_subcompartment)
+            ]
+            if exact_subcompartment_matches:
+                compartment_matches = exact_subcompartment_matches
+        if len(compartment_matches) == 1:
+            remaining = compartment_matches
+            differing_fields = _differing_fields(remaining)
+            if ambiguity_seen and len(prior_remaining) > 1:
+                resolution_source = "automatic"
+                resolution_reason = (
+                    "Automatically selected the only CF candidate whose compartment/subcompartment matched the flow."
+                )
+                resolution_candidates = prior_remaining
+        elif len(compartment_matches) > 1:
+            remaining = compartment_matches
+            differing_fields = _differing_fields(remaining)
+        elif strict:
+            message = (
+                "No compartment-specific characterisation factor matched the referenced flow metadata; "
+                + _error_message(
+                    category=category,
+                    flow=flow,
+                    process_id=process_id,
+                    process_name=process_name,
+                    candidates=remaining,
+                    differing_fields=differing_fields,
+                    diagnostic_file=diagnostic_file,
+                )
+            )
+            _append_cf_records(
+                remaining,
+                severity="error",
+                issue_type="ambiguity_failure",
+                group_key=f"ambiguity:{category.category_id}:{flow.flow_id}:{process_id}:compartment_miss",
+                message=message,
+                differing_fields=differing_fields,
+                ambiguity_records=ambiguity_records,
+                process_id=process_id,
+                process_name=process_name,
+                exchange_id=exchange_id,
+                exchange_index=exchange_index,
+                ambiguity_key=ambiguity_key,
+            )
+            if warning_records is not None:
+                warning_records.append(
+                    _warning_record(
+                        severity="error",
+                        category=category,
+                        flow=flow,
+                        process_id=process_id,
+                        process_name=process_name,
+                        message=message,
+                    )
+                )
+            if resolution_manager is not None:
+                resolution_manager.summary.n_cf_ambiguities_unresolved += 1
+            if record_only:
+                return None
+            raise AmbiguousCharacterisationFactorError(message)
+
+    compatibility_results = [
+        check_unit_compatibility(
+            exchange_unit_payload,
+            exchange_flow_property_payload,
+            flow,
+            candidate,
+            unit_registry,
+            strict_units=strict_units,
+            allow_water_mass_volume_override=allow_water_mass_volume_override,
+        )
+        for candidate in remaining
+    ]
+    compatibility_by_identity = {
+        id(candidate): result for candidate, result in zip(remaining, compatibility_results)
+    }
+    compatible_candidates = [
+        candidate
+        for candidate, result in zip(remaining, compatibility_results)
+        if result.compatible
+    ]
+    compatible_results = [
+        result
+        for result in compatibility_results
+        if result.compatible
+    ]
+    selected_unit_result: Optional[UnitCompatibilityResult] = None
+    prior_remaining = list(remaining)
+    if len(compatible_candidates) == 1:
+        remaining = compatible_candidates
+        selected_unit_result = compatible_results[0]
+        differing_fields = _differing_fields(remaining)
+        if ambiguity_seen and len(prior_remaining) > 1:
+            resolution_source = "automatic"
+            resolution_reason = (
+                "Automatically selected the only unit-compatible CF candidate after strict unit and flow-property checks."
+            )
+            resolution_candidates = prior_remaining
+    elif not compatible_candidates:
+        representative_result = compatibility_results[0]
+        message = (
+            "No directly compatible characterisation factor candidate remained after unit/flow-property checks; "
+            + _error_message(
+                category=category,
+                flow=flow,
+                process_id=process_id,
+                process_name=process_name,
+                candidates=remaining,
+                differing_fields=["cf_unit", "cf_flow_property_id"],
+                diagnostic_file=diagnostic_file,
+            )
+            + "; "
+            + _unit_failure_detail(representative_result)
+        )
+        _append_cf_records(
+            remaining,
+            severity="error",
+            issue_type="unit_conflict",
+            group_key=f"unit:{category.category_id}:{flow.flow_id}:{process_id}",
+            message=message,
+            differing_fields=["cf_unit", "cf_flow_property_id"],
+            ambiguity_records=ambiguity_records,
+            unit_compatibility=representative_result,
+            flow=flow,
+            process_id=process_id,
+            process_name=process_name,
+            exchange_id=exchange_id,
+            exchange_index=exchange_index,
+            ambiguity_key=ambiguity_key,
+        )
+        if warning_records is not None:
+            warning_records.append(
+                _warning_record(
+                    severity="error",
+                    category=category,
+                    flow=flow,
+                    process_id=process_id,
+                    process_name=process_name,
+                    message=message,
+                )
+            )
+        if record_only:
+            return None
+        raise UnitCompatibilityError(message)
+    else:
+        remaining = compatible_candidates
+        preferred_candidate, preferred_result, preferred_reason = _prefer_compatible_candidate(
+            compatible_candidates,
+            compatible_results,
+        )
+        if preferred_candidate is not None and preferred_result is not None:
+            remaining = [preferred_candidate]
+            selected_unit_result = preferred_result
+            differing_fields = _differing_fields(remaining)
+            if ambiguity_seen and len(prior_remaining) > 1:
+                resolution_source = "automatic"
+                resolution_reason = preferred_reason
+                resolution_candidates = prior_remaining
+        else:
+            selected_unit_result = compatible_results[0] if len(compatible_results) == 1 else None
+            differing_fields = _differing_fields(remaining)
+
+    if selected_unit_result is not None and selected_unit_result.reason == "water_mass_volume_override":
+        _append_water_override_warning(
+            category=category,
+            flow=flow,
+            process_id=process_id,
+            process_name=process_name,
+            warning_records=warning_records,
+            exchange_unit_name=selected_unit_result.exchange_unit_name,
+            cf_unit_name=selected_unit_result.cf_unit_name,
+        )
+
+    regionalised = any(
+        _candidate_location_key(candidate) != _candidate_location_key(remaining[0])
+        for candidate in remaining[1:]
+    )
+    if regionalised:
+        prior_remaining = list(remaining)
+        contexts = [
+            _extract_location_metadata(exchange),
+            (flow.location_id, flow.location_name, flow.location_region),
+        ]
+        if process_data is not None and _category_is_regionalised(category):
+            contexts.append(_extract_location_metadata(process_data))
+        for context_id, context_name, context_region in contexts:
+            context_keys = _context_location_keys(context_id, context_name, context_region)
+            if not context_keys:
+                continue
+            scored_matches = [
+                (candidate, _location_match_score(candidate, context_keys))
+                for candidate in remaining
+            ]
+            scored_matches = [
+                (candidate, score)
+                for candidate, score in scored_matches
+                if score > 0
+            ]
+            if not scored_matches:
+                continue
+            best_score = max(score for _, score in scored_matches)
+            current_matches = [
+                candidate
+                for candidate, score in scored_matches
+                if score == best_score
+            ]
+            if len(current_matches) == 1:
+                remaining = current_matches
+                differing_fields = _differing_fields(remaining)
+                if ambiguity_seen and len(prior_remaining) > 1:
+                    resolution_source = "automatic"
+                    resolution_reason = (
+                        "Automatically selected the only CF candidate with the strongest location match."
+                    )
+                    resolution_candidates = prior_remaining
+                break
+            if len(current_matches) > 1:
+                remaining = current_matches
+                differing_fields = _differing_fields(remaining)
+
+    if selected_unit_result is None and len(remaining) == 1:
+        selected_unit_result = compatibility_by_identity.get(id(remaining[0]))
+
+    if ambiguity_seen and resolution_source and len(remaining) == 1:
+        if resolution_source == "automatic" and resolution_manager is not None:
+            resolution_manager.record_automatic_resolution()
+        chosen_candidate = remaining[0]
+        message = (
+            f"CF ambiguity resolved {resolution_source}: {resolution_reason}; "
+            f"chosen_cf_value={_format_cf_value(chosen_candidate)}; "
+            f"category_id={category.category_id}; flow_id={flow.flow_id}; "
+            f"process_id={process_id}; exchange_id={exchange_id}; exchange_index={exchange_index}; "
+            f"source_file={chosen_candidate.source_file}; "
+            f"candidate_count={len(resolution_candidates) or len(candidates)}"
+        )
+        _append_cf_records(
+            resolution_candidates or candidates,
+            severity="info",
+            issue_type="ambiguity_resolution",
+            group_key=f"resolution:{category.category_id}:{flow.flow_id}:{process_id}:{exchange_id}:{exchange_index}",
+            message=message,
+            differing_fields=differing_fields,
+            ambiguity_records=ambiguity_records,
+            process_id=process_id,
+            process_name=process_name,
+            exchange_id=exchange_id,
+            exchange_index=exchange_index,
+            ambiguity_key=ambiguity_key,
+            resolution_status=resolution_source,
+            occurrence_timestamp="",
+            chosen_candidate=chosen_candidate,
+        )
+        _append_resolution_warning(
+            category=category,
+            flow=flow,
+            process_id=process_id,
+            process_name=process_name,
+            warning_records=warning_records,
+            message=message,
+        )
+
+    if len(remaining) > 1:
+        message = (
+            "Finite ambiguous characterisation factor candidates retained for scenario-row expansion; "
+            + _error_message(
+                category=category,
+                flow=flow,
+                process_id=process_id,
+                process_name=process_name,
+                candidates=remaining,
+                differing_fields=differing_fields,
+                diagnostic_file=diagnostic_file,
+            )
+        )
+        _append_cf_records(
+            remaining,
+            severity="info",
+            issue_type="scenario_candidate_set",
+            group_key=f"scenario:{category.category_id}:{flow.flow_id}:{process_id}:{exchange_id}:{exchange_index}",
+            message=message,
+            differing_fields=differing_fields,
+            ambiguity_records=ambiguity_records,
+            process_id=process_id,
+            process_name=process_name,
+            exchange_id=exchange_id,
+            exchange_index=exchange_index,
+            ambiguity_key=ambiguity_key,
+        )
+
+    return AdmissibleCharacterisationFactorSet(
+        options=[
+            AdmissibleCharacterisationFactor(
+                candidate=candidate,
+                conversion_factor=(
+                    compatibility_by_identity.get(id(candidate)).conversion_factor
+                    if compatibility_by_identity.get(id(candidate)) is not None
+                    else 1.0
+                ),
+                unit_compatibility=compatibility_by_identity.get(id(candidate)),
+            )
+            for candidate in remaining
+        ],
+        candidate_count=len(deduplicated),
+        differing_fields=differing_fields,
+        ambiguity_key=ambiguity_key,
+    )
+
+
+def resolve_cf_for_exchange(
+    category: ImpactCategory,
+    exchange: dict,
+    flow: FlowInfo,
+    candidates: Sequence[CharacterisationFactorCandidate],
+    unit_registry: Dict[str, UnitInfo],
+    strict_units: bool = True,
+    allow_water_mass_volume_override: bool = False,
+    strict: bool = True,
+    *,
+    exchange_index: int = -1,
+    process_data: Optional[dict] = None,
+    warning_records: Optional[List[WarningRecord]] = None,
+    ambiguity_records: Optional[List[CFAmbiguityRecord]] = None,
+    diagnostic_file: str = "",
+    resolution_manager: Optional[CFResolutionManager] = None,
+    record_only: bool = False,
 ) -> Optional[ResolvedCharacterisationFactor]:
     if not candidates:
         return None
@@ -1044,6 +1939,10 @@ def resolve_cf_for_exchange(
                         message=message,
                     )
                 )
+            if resolution_manager is not None:
+                resolution_manager.summary.n_cf_ambiguities_unresolved += 1
+            if record_only:
+                return None
             raise AmbiguousCharacterisationFactorError(message)
         prior_remaining = list(remaining)
         compartment_matches = []
@@ -1111,8 +2010,10 @@ def resolve_cf_for_exchange(
                         process_id=process_id,
                         process_name=process_name,
                         message=message,
-                    )
                 )
+            )
+            if record_only:
+                return None
             raise AmbiguousCharacterisationFactorError(message)
 
     compatibility_results = [
@@ -1123,6 +2024,7 @@ def resolve_cf_for_exchange(
             candidate,
             unit_registry,
             strict_units=strict_units,
+            allow_water_mass_volume_override=allow_water_mass_volume_override,
         )
         for candidate in remaining
     ]
@@ -1194,6 +2096,8 @@ def resolve_cf_for_exchange(
                     message=message,
                 )
             )
+        if record_only:
+            return None
         raise UnitCompatibilityError(message)
     else:
         remaining = compatible_candidates
@@ -1212,6 +2116,17 @@ def resolve_cf_for_exchange(
         else:
             selected_unit_result = compatible_results[0] if len(compatible_results) == 1 else None
             differing_fields = _differing_fields(remaining)
+
+    if selected_unit_result is not None and selected_unit_result.reason == "water_mass_volume_override":
+        _append_water_override_warning(
+            category=category,
+            flow=flow,
+            process_id=process_id,
+            process_name=process_name,
+            warning_records=warning_records,
+            exchange_unit_name=selected_unit_result.exchange_unit_name,
+            cf_unit_name=selected_unit_result.cf_unit_name,
+        )
 
     regionalised = any(
         _candidate_location_key(candidate) != _candidate_location_key(remaining[0])
@@ -1295,36 +2210,11 @@ def resolve_cf_for_exchange(
                         process_id=process_id,
                         process_name=process_name,
                         message=message,
-                    )
-                )
-            raise AmbiguousCharacterisationFactorError(message)
-
-    if len(remaining) > 1 and ambiguity_context is not None and resolution_manager is not None:
-        ambiguity_context.differing_fields = list(differing_fields)
-        decision = resolution_manager.resolve_ambiguity(ambiguity_context, remaining)
-        if decision.status in {"user_choice", "reused_choice"} and decision.candidate is not None:
-            resolution_source = decision.status
-            resolution_reason = decision.reason
-            resolution_candidates = list(remaining)
-            remaining = [decision.candidate]
-            selected_unit_result = compatibility_by_identity.get(id(decision.candidate), selected_unit_result)
-            differing_fields = _differing_fields(remaining)
-        elif decision.status == "cancel_run":
-            message = (
-                "Run cancelled during CF ambiguity resolution; "
-                + decision.reason
-                + "; "
-                + _error_message(
-                    category=category,
-                    flow=flow,
-                    process_id=process_id,
-                    process_name=process_name,
-                    candidates=remaining,
-                    differing_fields=differing_fields,
-                    diagnostic_file=diagnostic_file,
                 )
             )
-            raise RunCancelledError(message)
+            if record_only:
+                return None
+            raise AmbiguousCharacterisationFactorError(message)
 
     if len(remaining) != 1:
         message = (
@@ -1364,6 +2254,10 @@ def resolve_cf_for_exchange(
                     message=message,
                 )
             )
+        if resolution_manager is not None:
+            resolution_manager.summary.n_cf_ambiguities_unresolved += 1
+        if record_only:
+            return None
         raise AmbiguousCharacterisationFactorError(message)
 
     if selected_unit_result is None:
@@ -1373,16 +2267,6 @@ def resolve_cf_for_exchange(
         if resolution_source == "automatic" and resolution_manager is not None:
             resolution_manager.record_automatic_resolution()
         chosen_candidate = remaining[0]
-        occurrence_timestamp = (
-            decision.audit_record.timestamp
-            if decision is not None and getattr(decision, "audit_record", None) is not None
-            else ""
-        )
-        choice_origin = (
-            decision.audit_record.choice_origin
-            if decision is not None and getattr(decision, "audit_record", None) is not None
-            else ("automatic" if resolution_source == "automatic" else "")
-        )
         message = (
             f"CF ambiguity resolved {resolution_source}: {resolution_reason}; "
             f"chosen_cf_value={_format_cf_value(chosen_candidate)}; "
@@ -1405,8 +2289,7 @@ def resolve_cf_for_exchange(
             exchange_index=exchange_index,
             ambiguity_key=ambiguity_key,
             resolution_status=resolution_source,
-            choice_origin=choice_origin,
-            occurrence_timestamp=occurrence_timestamp,
+            occurrence_timestamp="",
             chosen_candidate=chosen_candidate,
         )
         _append_resolution_warning(

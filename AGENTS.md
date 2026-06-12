@@ -209,7 +209,6 @@ For default audit tau values 0.95 and 0.99, the CSV columns must be exactly:
 - `eta_0_99`
 - `eta_0_99_witness`
 - `loss_max_0_99`
-- `cf_status`
 
 Do not include `protected` in the compact priority CSV.
 
@@ -244,23 +243,386 @@ For the compact priority CSV:
 
 For a selected flow set `F`, do not claim exact combined `eta_F(tau)` from the compact CSV alone.
 
-Only claim the conservative screen:
+Only claim the conservative grouped-flow screen:
 
 ```text
-max_{f in F} eta_f(tau) <= exact group eta_F(tau) <= min(tau, sum_{f in F} loss_max_f(tau))
-```
-
-If exact grouped failed-set analysis is needed, require a future ledger or recomputation workflow.
+max_{f in G} eta_f(tau*) <= eta_G(tau*) <=
+min(
+  tau*,
+  min_{g in G} [
+    eta_g(tau*) + sum_{f in G \ {g}} loss_max_f(tau*)
+  ]
+)
 
 ## Scope of guarantees
 
 The lite-database tau certificate is local to:
 - the selected LCIA categories;
 - the resolved characterisation factors and unit conversions used in the run;
-- each process after sign-splitting into positive and negative characterised contributions.
+- each process after sign-splitting into positive and negative characterised contributions;
+- complete indicator-scenario coverage rows when finite CF ambiguity remains.
+
+Finite CF ambiguity is handled by complete indicator-scenario coverage rows.
+
+If a selected LCIA category has finite admissible CF ambiguity in a process:
+- exact contributions for that category must be included in every scenario row for that category;
+- regionalised ambiguity must be grouped by shared location context where possible;
+- user CF choice is not part of normal scientific reduction;
+- no arbitrary candidate is selected;
+- normal create and priority workflows must not depend on or emit a CF choices CSV.
+
+Priority metrics are computed over the same coverage rows as reduction.
 
 Do not claim that the reduction preserves:
 - non-selected LCIA methods;
 - every possible product-system result;
 - non-LCIA uses of elementary exchanges;
 - results under different CF-resolution assumptions.
+
+
+
+
+
+
+
+````markdown
+## Additional GUI tab: single-process greedy versus exact openLCA diagnostic
+
+Add one optional diagnostic tab to the app.
+
+Purpose:
+- compare the implemented greedy tau-cover with an exact binary optimisation solution;
+- use one selected process only;
+- use up to five tau values;
+- create an importable openLCA JSON-LD ZIP containing two diagnostic process variants;
+- support methodological validation, not whole-database benchmarking.
+
+This tab must not:
+- run exact optimisation over the whole database;
+- modify the input ZIP in place;
+- overwrite the original selected process;
+- claim whole-database global optimality;
+- become a benchmarking dashboard.
+
+### Inputs
+
+The tab must allow the user to select:
+
+- input openLCA JSON-LD ZIP;
+- optional LCIA methods JSON-LD ZIP or folder;
+- LCIA indicator selection;
+- one process, selected by process name and UUID;
+- one to five tau values;
+- sign mode:
+  - positive only;
+  - negative only;
+  - both signs, default.
+
+Tau values must be validated:
+- each tau must be in `(0, 1]`;
+- duplicate tau values must be removed or rejected clearly;
+- values should be sorted ascending for reporting and plotting;
+- maximum number of tau values is five.
+
+### Solver choice
+
+Use SciPy HiGHS MILP through `scipy.optimize.milp` as the exact solver.
+
+Do not use commercial solvers.
+
+Do not require PuLP, OR-Tools, Gurobi, CPLEX, CBC, or GLPK.
+
+If SciPy MILP is unavailable, show a clear UI error explaining that the exact comparison requires a SciPy version with `scipy.optimize.milp`.
+
+### Exact optimisation model
+
+For the selected process and selected sign, build the same non-negative contribution matrix used by the main reduction workflow:
+
+```text
+m[r, e] >= 0
+S[r] = sum_e m[r, e]
+````
+
+Only active rows with `S[r] > 0` are included.
+
+For each tau value, solve:
+
+```text
+minimise      sum_e x[e]
+
+subject to    sum_e m[r, e] x[e] >= tau * S[r]    for every active row r
+              x[e] in {0, 1}
+```
+
+Implement this as a binary MILP.
+
+For SciPy:
+
+```text
+objective: c = ones(n_exchanges)
+
+constraints:
+    -M x <= -tau * S
+
+bounds:
+    0 <= x[e] <= 1
+
+integrality:
+    x[e] binary
+```
+
+The exact result must be computed separately for positive and negative contribution matrices, exactly as in the main workflow.
+
+If both signs are selected, report:
+
+* greedy positive count;
+* exact positive count;
+* greedy negative count;
+* exact negative count;
+* greedy union count;
+* exact union count.
+
+The exact union is:
+
+```text
+exact_selected = exact_positive OR exact_negative OR protected
+```
+
+The greedy union is:
+
+```text
+greedy_selected = greedy_positive OR greedy_negative OR protected
+```
+
+### Diagnostic ZIP output
+
+The tab must create an importable openLCA JSON-LD ZIP.
+
+The diagnostic ZIP must preserve the full database structure from the input ZIP unless a clear, tested minimal-export mode is implemented.
+
+Default output mode:
+
+```text
+complete_database_with_diagnostic_processes
+```
+
+In this default mode:
+
+* copy all original JSON-LD objects unchanged;
+* keep the original selected process unchanged;
+* create two cloned diagnostic process objects for the selected tau value chosen as the export tau:
+
+  * `{original process name}_greedy`
+  * `{original process name}_exact`
+* assign new UUIDs only to the two cloned diagnostic processes;
+* do not regenerate UUIDs for any existing object;
+* do not modify flow, unit, category, actor, source, LCIA method, product system, or provider objects;
+* preserve the quantitative reference exchange in each cloned process;
+* preserve technosphere exchanges, product exchanges, waste exchanges, provider links, allocation data, process parameters, and uncertainty metadata;
+* remove only non-selected elementary exchanges from the cloned diagnostic process exchange lists.
+
+The export tau must be explicitly selected in the UI if more than one tau value is supplied.
+
+The exact diagnostic process may only be written if the exact solver status is optimal for the selected export tau. If the exact solver is infeasible, unavailable, timed out, or not optimal:
+
+* still write the greedy diagnostic process if valid;
+* do not write a fake exact process;
+* show a clear warning;
+* record the missing exact process in metadata.
+
+### Naming and metadata
+
+The cloned processes must have names:
+
+```text
+{process name}_greedy
+{process name}_exact
+```
+
+If the names already exist in the database, append a deterministic suffix:
+
+```text
+{process name}_greedy_tau_{tau}
+{process name}_exact_tau_{tau}
+```
+
+Each cloned process description must include:
+
+* original process name;
+* original process UUID;
+* tau;
+* selected LCIA methods/categories;
+* solver type;
+* sign mode;
+* retained elementary exchange count;
+* removed elementary exchange count;
+* minimum coverage achieved;
+* creation timestamp;
+* statement that the process is a diagnostic clone.
+
+Also write:
+
+```text
+greedy_exact_diagnostic_metadata.json
+greedy_exact_diagnostic_summary.csv
+greedy_exact_tau_curve.csv
+greedy_exact_tau_curve.png
+```
+
+### Tau-curve graph
+
+For up to five tau values, compute greedy and exact retained exchange counts for the selected process.
+
+The graph must show:
+
+* x-axis: tau;
+* y-axis: retained elementary exchange count;
+* one line for greedy;
+* one line for exact, only for tau values where exact solved optimally.
+
+If exact solving fails for any tau:
+
+* leave that exact point missing;
+* report the solver status in the CSV and UI;
+* do not interpolate fake values.
+
+The graph is descriptive only. It must not be used as a proof of whole-database behaviour.
+
+### UI output
+
+Show a compact comparison table:
+
+```text
+tau | sign | active rows | candidate exchanges | greedy retained | exact retained | gap exchanges | gap % | exact status
+```
+
+Where:
+
+```text
+gap exchanges = greedy retained - exact retained
+gap % = 100 * (greedy retained - exact retained) / exact retained
+```
+
+Only compute gap percentage when exact retained is greater than zero.
+
+Also show:
+
+* selected process name;
+* selected process UUID;
+* number of protected exchanges;
+* greedy minimum coverage;
+* exact minimum coverage, if solved;
+* whether both pass the tau certificate;
+* solver runtime for each tau;
+* path to the diagnostic ZIP;
+* path to the tau-curve CSV and PNG.
+
+### Consistency requirements
+
+The diagnostic tab must reuse the same code paths as the main workflow for:
+
+* ZIP reading and writing;
+* process parsing;
+* elementary exchange identification;
+* unit conversion;
+* LCIA characterisation factor resolution;
+* coverage-row construction;
+* positive/negative sign splitting;
+* protected exchange handling;
+* greedy tau-cover;
+* coverage verification.
+
+Do not implement a second independent LCIA parser for this tab.
+
+The exact solver may only replace the final selection step after the contribution matrix has been built.
+
+### Limits and failure behaviour
+
+The exact solver is only intended for small selected processes.
+
+Before solving, display:
+
+* number of elementary exchange columns;
+* number of active coverage rows;
+* number of binary variables;
+* number of constraints.
+
+Default limits:
+
+```text
+max_binary_variables = 250
+max_active_rows = 1000
+solver_time_limit_seconds = 30
+max_tau_values = 5
+```
+
+If the selected process exceeds the configured exact-solver limits:
+
+* refuse exact solving cleanly;
+* still show greedy results;
+* do not create an exact diagnostic process;
+* write the reason in metadata.
+
+If the exact solver times out or returns no optimal solution:
+
+* report the solver status clearly;
+* do not report a fake exact retained count;
+* do not create a fake exact-reduced process.
+
+### Interpretation text in UI
+
+The tab must display this warning:
+
+```text
+The exact result is a single-process diagnostic for the selected LCIA rows and tau value. It does not prove global optimality of the whole reduced database. The diagnostic ZIP contains cloned process variants for inspection in openLCA; it does not replace the main database-scale tau-reduction workflow.
+```
+
+### Tests
+
+Add tests for:
+
+* exact solver matches greedy on a trivial one-row case;
+* exact solver improves on greedy on a constructed multi-row case where greedy is suboptimal;
+* exact solver satisfies tau coverage;
+* exact solver handles positive and negative matrices separately;
+* exact union includes protected exchanges;
+* exact failure does not create a fake exact process;
+* cloned greedy and exact processes get new UUIDs;
+* original selected process remains unchanged;
+* all non-selected database objects remain unchanged;
+* diagnostic ZIP imports structurally as JSON-LD;
+* tau-curve CSV contains at most five tau values;
+* exact failed tau values are recorded without interpolation;
+* diagnostic tab does not modify the input ZIP.
+
+```
+```
+
+
+## Additional workflow: EcoSpold1 support with new tabs ecospold priority  and ecospold reducer.
+
+Add EcoSpold1 support alongside the existing JSON-LD workflow.
+
+Scope:
+
+* EcoSpold1 process ZIP or folder input;
+* optional EcoSpold1 impact-method ZIP or folder input;
+* no IPC and no active openLCA connection;
+* do not modify source files.
+
+Implement two EcoSpold1 workflows tabs using the existing mathematics and output rules:
+
+1. EcoSpold1 reducer
+
+2. EcoSpold1 LCIA-critical priority file
+
+Reuse existing code paths for:
+
+* LCIA contribution matrix construction;
+* unit handling;
+* CF resolution;
+* positive and negative sign splitting;
+* greedy tau-cover;
+* coverage verification;
+* priority metrics and witness reporting.
+

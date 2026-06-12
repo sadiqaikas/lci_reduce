@@ -35,7 +35,6 @@ DEFAULT_FIELDNAMES = [
     "loss_max_0_95",
     "eta_0_99",
     "loss_max_0_99",
-    "cf_status",
 ]
 
 
@@ -55,7 +54,6 @@ def _priority_row(**overrides: str) -> dict[str, str]:
         "loss_max_0_95": "0",
         "eta_0_99": "0",
         "loss_max_0_99": "0",
-        "cf_status": "characterised",
     }
     row.update(overrides)
     return row
@@ -87,36 +85,38 @@ def test_single_flow_ranking_uses_eta_then_loss_max(tmp_path: Path) -> None:
     assert [row.flow_id for row in ranked] == ["A", "B", "C"]
 
 
-def test_group_bound_does_not_sum_eta_values(tmp_path: Path) -> None:
+def test_group_bound_uses_tighter_anchored_upper_bound(tmp_path: Path) -> None:
     csv_path = _write_priority_csv(
         tmp_path / "priority.csv",
         [
-            _priority_row(flow_id="A", flow_name="A", eta_0_95="0.0", loss_max_0_95="0.02"),
-            _priority_row(flow_id="B", flow_name="B", eta_0_95="0.0", loss_max_0_95="0.02"),
+            _priority_row(flow_id="A", flow_name="A", eta_0_95="0.11", loss_max_0_95="0.15"),
+            _priority_row(flow_id="B", flow_name="B", eta_0_95="0.05", loss_max_0_95="0.06"),
         ],
     )
     dataset = load_priority_dataset(csv_path)
     pair = dataset.get_tau_pair(0.95)
     result = analyse_selected_group(dataset.rows, pair)
-    assert result.lower_bound == pytest.approx(0.0)
-    assert result.upper_bound == pytest.approx(0.04)
-    assert result.sum_loss_max == pytest.approx(0.04)
+    assert result.lower_bound == pytest.approx(0.11)
+    assert result.upper_bound == pytest.approx(0.17)
+    assert result.sum_loss_max == pytest.approx(0.21)
     assert result.exact_eta is None
 
 
-def test_group_bound_with_serious_lower_bound(tmp_path: Path) -> None:
+def test_group_bound_remains_conservative_but_tighter_than_sum_loss_max(tmp_path: Path) -> None:
     csv_path = _write_priority_csv(
         tmp_path / "priority.csv",
         [
-            _priority_row(flow_id="A", flow_name="A", eta_0_95="0.42", loss_max_0_95="0.50"),
-            _priority_row(flow_id="B", flow_name="B", eta_0_95="0.08", loss_max_0_95="0.13"),
+            _priority_row(flow_id="A", flow_name="A", eta_0_95="0.12", loss_max_0_95="0.14"),
+            _priority_row(flow_id="B", flow_name="B", eta_0_95="0.05", loss_max_0_95="0.08"),
+            _priority_row(flow_id="C", flow_name="C", eta_0_95="0.03", loss_max_0_95="0.04"),
         ],
     )
     dataset = load_priority_dataset(csv_path)
     pair = dataset.get_tau_pair(0.95)
     result = analyse_selected_group(dataset.rows, pair)
-    assert result.lower_bound == pytest.approx(0.42)
-    assert result.upper_bound == pytest.approx(0.63)
+    assert result.lower_bound == pytest.approx(0.12)
+    assert result.upper_bound == pytest.approx(0.23)
+    assert result.sum_loss_max == pytest.approx(0.26)
     assert result.exact_eta is None
 
 
@@ -132,9 +132,42 @@ def test_single_selected_flow_reports_exact_eta(tmp_path: Path) -> None:
     pair = dataset.get_tau_pair(0.95)
     result = analyse_selected_group([dataset.rows_by_flow_id["B"]], pair)
     assert result.lower_bound == pytest.approx(0.08)
-    assert result.upper_bound == pytest.approx(0.13)
+    assert result.upper_bound == pytest.approx(0.08)
     assert result.exact_eta == pytest.approx(0.08)
     assert result.exact_reason is not None
+
+
+def test_load_priority_dataset_rejects_eta_above_loss_max(tmp_path: Path) -> None:
+    csv_path = _write_priority_csv(
+        tmp_path / "priority.csv",
+        [
+            _priority_row(flow_id="A", flow_name="A", eta_0_95="0.11", loss_max_0_95="0.10"),
+        ],
+    )
+    with pytest.raises(PriorityAnalysisError, match="eta_0_95 greater than loss_max_0_95"):
+        load_priority_dataset(csv_path)
+
+
+def test_load_priority_dataset_ignores_eta_witness_columns_when_detecting_tau_pairs(tmp_path: Path) -> None:
+    fieldnames = [
+        *DEFAULT_FIELDNAMES,
+        "eta_0_95_witness",
+        "eta_0_99_witness",
+    ]
+    csv_path = _write_priority_csv(
+        tmp_path / "priority_with_witness.csv",
+        [
+            _priority_row(
+                flow_id="A",
+                flow_name="A",
+                eta_0_95_witness="Process A | Climate change | +",
+                eta_0_99_witness="Process B | Climate change | -",
+            ),
+        ],
+        fieldnames=fieldnames,
+    )
+    dataset = load_priority_dataset(csv_path)
+    assert [pair.token for pair in dataset.tau_pairs] == ["0_95", "0_99"]
 
 
 def test_group_bound_collapsing_to_zero_reports_exact_zero(tmp_path: Path) -> None:
@@ -189,8 +222,15 @@ def test_critical_only_at_099_filter(tmp_path: Path) -> None:
     csv_path = _write_priority_csv(
         tmp_path / "priority.csv",
         [
-            _priority_row(flow_id="A", flow_name="A", eta_0_95="0", eta_0_99="0.04"),
-            _priority_row(flow_id="B", flow_name="B", eta_0_95="0.01", eta_0_99="0.04"),
+            _priority_row(flow_id="A", flow_name="A", eta_0_95="0", eta_0_99="0.04", loss_max_0_99="0.04"),
+            _priority_row(
+                flow_id="B",
+                flow_name="B",
+                eta_0_95="0.01",
+                loss_max_0_95="0.01",
+                eta_0_99="0.04",
+                loss_max_0_99="0.04",
+            ),
             _priority_row(flow_id="C", flow_name="C", eta_0_95="0", eta_0_99="0"),
         ],
     )
@@ -218,7 +258,6 @@ def test_schema_validation_and_custom_tau_detection(tmp_path: Path) -> None:
             "tau_entry_median",
             "tau_entry_max",
             "eta_0_95",
-            "cf_status",
         ],
     )
     with pytest.raises(PriorityAnalysisError, match="missing one side of an eta/loss_max pair"):
@@ -240,7 +279,6 @@ def test_schema_validation_and_custom_tau_detection(tmp_path: Path) -> None:
                 "tau_entry_max": "0.1",
                 "eta_0_975": "0.2",
                 "loss_max_0_975": "0.3",
-                "cf_status": "characterised",
             }
         ],
         fieldnames=[
@@ -256,11 +294,41 @@ def test_schema_validation_and_custom_tau_detection(tmp_path: Path) -> None:
             "tau_entry_max",
             "eta_0_975",
             "loss_max_0_975",
-            "cf_status",
         ],
     )
     dataset = load_priority_dataset(custom_path)
     assert dataset.get_tau_pair(None).tau == pytest.approx(0.975)
+
+
+def test_load_priority_dataset_accepts_legacy_cf_status_column(tmp_path: Path) -> None:
+    csv_path = _write_priority_csv(
+        tmp_path / "legacy.csv",
+        [
+            _priority_row(flow_id="A", flow_name="A", cf_status="partly_characterised"),
+        ],
+        fieldnames=[*DEFAULT_FIELDNAMES, "cf_status"],
+    )
+    dataset = load_priority_dataset(csv_path)
+    row = dataset.rows_by_flow_id["A"]
+    assert dataset.has_cf_status_column is True
+    assert row.cf_status == "partly_characterised"
+    assert row.display_cf_status == "partly_characterised"
+
+
+def test_load_priority_dataset_derives_status_when_cf_status_is_absent(tmp_path: Path) -> None:
+    csv_path = _write_priority_csv(
+        tmp_path / "derived.csv",
+        [
+            _priority_row(flow_id="A", occurrence_count="4", characterised_occurrence_count="0"),
+            _priority_row(flow_id="B", occurrence_count="4", characterised_occurrence_count="2"),
+            _priority_row(flow_id="C", occurrence_count="4", characterised_occurrence_count="4"),
+        ],
+    )
+    dataset = load_priority_dataset(csv_path)
+    assert dataset.has_cf_status_column is False
+    assert dataset.rows_by_flow_id["A"].display_cf_status == "uncharacterised (derived)"
+    assert dataset.rows_by_flow_id["B"].display_cf_status == "partly_characterised (derived)"
+    assert dataset.rows_by_flow_id["C"].display_cf_status == "characterised (derived)"
 
 
 def test_name_matching_and_flow_id_priority(tmp_path: Path) -> None:

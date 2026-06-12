@@ -10,7 +10,14 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
+from tempfile import gettempdir
+
+_MPLCONFIGDIR = Path(os.environ.get("MPLCONFIGDIR") or (Path(gettempdir()) / "lci_reduce_mplconfig"))
+_MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPLCONFIGDIR))
 
 
 def main(argv: list[str] | None = None) -> int:

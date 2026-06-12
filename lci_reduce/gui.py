@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import csv
 import json
+import shlex
 import sys
 import threading
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
-    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -50,11 +49,16 @@ except Exception:  # pragma: no cover - fallback path
     QChart = QChartView = QLineSeries = QValueAxis = None
     QT_CHARTS_AVAILABLE = False
 
-from .cf_resolution import CFAmbiguityContext, CFPromptResult, candidate_display_text
 from .cli import CLI_GUIDE_SECTIONS, create_command, inspect_command, priority_command
 from .errors import RunCancelledError
+from .ambiguity_explorer import explore_ambiguities, AmbiguityExploreConfig
+from .greedy_exact_diagnostic import (
+    diagnostic_warning_text,
+    normalise_diagnostic_tau_values,
+    run_greedy_exact_diagnostic,
+    GreedyExactDiagnosticConfig,
+)
 from .models import CreateProgressUpdate, DatabaseReductionGroup, TauReductionRun
-from .priority_analyser_gui import PriorityAnalyserPanel
 from .reduction_curves import clone_run, curve_point_is_valid, export_curve_rows, extract_run_metadata, group_warnings
 
 
@@ -72,64 +76,6 @@ def _sort_runs(runs: list[TauReductionRun]) -> list[TauReductionRun]:
         return (tau, run.sourceFileName.lower())
 
     return sorted(runs, key=key)
-
-
-class CFAmbiguityDialog(QDialog):
-    def __init__(self, parent, context: CFAmbiguityContext, candidate_texts: list[str]) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Resolve CF ambiguity")
-        self.prompt_result = CFPromptResult(action="cancel_run")
-
-        layout = QVBoxLayout(self)
-        summary = QLabel(
-            "\n".join(
-                [
-                    f"Process: {context.process_name or context.process_id or '-'}",
-                    f"Exchange/Flow: {context.flow_name or context.flow_id or '-'} ({context.exchange_id or '-'})",
-                    f"LCIA Category: {context.category_name or context.category_id or '-'}",
-                    f"Differing fields: {', '.join(context.differing_fields) or 'none'}",
-                ]
-            )
-        )
-        summary.setWordWrap(True)
-        layout.addWidget(summary)
-
-        self.choice_list = QListWidget()
-        for index, text in enumerate(candidate_texts, start=1):
-            self.choice_list.addItem(f"Candidate {index}\n{text}")
-        if candidate_texts:
-            self.choice_list.setCurrentRow(0)
-        self.choice_list.setMinimumHeight(320)
-        layout.addWidget(self.choice_list)
-
-        buttons = QHBoxLayout()
-        select_button = QPushButton("Select")
-        select_button.clicked.connect(self._select_choice)
-        skip_button = QPushButton("Skip or fail")
-        skip_button.clicked.connect(self._skip_fail)
-        cancel_button = QPushButton("Cancel run")
-        cancel_button.setObjectName("danger")
-        cancel_button.clicked.connect(self._cancel_run)
-        buttons.addWidget(select_button)
-        buttons.addWidget(skip_button)
-        buttons.addWidget(cancel_button)
-        layout.addLayout(buttons)
-
-    def _select_choice(self) -> None:
-        row = self.choice_list.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Selection required", "Select a candidate before continuing.")
-            return
-        self.prompt_result = CFPromptResult(action="select", candidate_index=row)
-        self.accept()
-
-    def _skip_fail(self) -> None:
-        self.prompt_result = CFPromptResult(action="skip_fail")
-        self.done(0)
-
-    def _cancel_run(self) -> None:
-        self.prompt_result = CFPromptResult(action="cancel_run")
-        self.done(0)
 
 
 class InspectWorker(QObject):
@@ -156,7 +102,6 @@ class CreateWorker(QObject):
     progress = Signal(object)
     finished = Signal(object)
     failed = Signal(str)
-    prompt_requested = Signal(object, object)
     done = Signal()
 
     def __init__(
@@ -170,7 +115,7 @@ class CreateWorker(QObject):
         uncharacterised_policy: str,
         strict_units: bool,
         tolerance: float,
-        cf_resolution_file: str | None,
+        allow_water_mass_volume_override: bool,
     ) -> None:
         super().__init__()
         self.database = database
@@ -181,30 +126,7 @@ class CreateWorker(QObject):
         self.uncharacterised_policy = uncharacterised_policy
         self.strict_units = strict_units
         self.tolerance = tolerance
-        self.cf_resolution_file = cf_resolution_file
-        self._prompt_lock = threading.Lock()
-        self._prompt_event: threading.Event | None = None
-        self._prompt_result: CFPromptResult | None = None
-
-    def deliver_prompt_result(self, result: CFPromptResult) -> None:
-        with self._prompt_lock:
-            self._prompt_result = result
-            event = self._prompt_event
-        if event is not None:
-            event.set()
-
-    def _prompt_cf(self, context: CFAmbiguityContext, candidates) -> CFPromptResult:
-        event = threading.Event()
-        with self._prompt_lock:
-            self._prompt_event = event
-            self._prompt_result = CFPromptResult(action="cancel_run")
-        self.prompt_requested.emit(context, list(candidates))
-        event.wait()
-        with self._prompt_lock:
-            result = self._prompt_result or CFPromptResult(action="cancel_run")
-            self._prompt_event = None
-            self._prompt_result = None
-        return result
+        self.allow_water_mass_volume_override = allow_water_mass_volume_override
 
     @Slot()
     def run(self) -> None:
@@ -218,8 +140,7 @@ class CreateWorker(QObject):
                 uncharacterised_policy=self.uncharacterised_policy,
                 strict_units=self.strict_units,
                 tolerance=self.tolerance,
-                cf_resolution_file=self.cf_resolution_file,
-                cf_prompt=self._prompt_cf,
+                allow_water_mass_volume_override=self.allow_water_mass_volume_override,
                 progress_callback=self.progress.emit,
             )
             self.finished.emit(result)
@@ -233,7 +154,6 @@ class PriorityWorker(QObject):
     progress = Signal(object)
     finished = Signal(object)
     failed = Signal(str)
-    prompt_requested = Signal(object, object)
     done = Signal()
 
     def __init__(
@@ -246,7 +166,7 @@ class PriorityWorker(QObject):
         audit_tau: list[float],
         strict_units: bool,
         tolerance: float,
-        cf_resolution_file: str | None,
+        allow_water_mass_volume_override: bool,
     ) -> None:
         super().__init__()
         self.database = database
@@ -256,30 +176,7 @@ class PriorityWorker(QObject):
         self.audit_tau = audit_tau
         self.strict_units = strict_units
         self.tolerance = tolerance
-        self.cf_resolution_file = cf_resolution_file
-        self._prompt_lock = threading.Lock()
-        self._prompt_event: threading.Event | None = None
-        self._prompt_result: CFPromptResult | None = None
-
-    def deliver_prompt_result(self, result: CFPromptResult) -> None:
-        with self._prompt_lock:
-            self._prompt_result = result
-            event = self._prompt_event
-        if event is not None:
-            event.set()
-
-    def _prompt_cf(self, context: CFAmbiguityContext, candidates) -> CFPromptResult:
-        event = threading.Event()
-        with self._prompt_lock:
-            self._prompt_event = event
-            self._prompt_result = CFPromptResult(action="cancel_run")
-        self.prompt_requested.emit(context, list(candidates))
-        event.wait()
-        with self._prompt_lock:
-            result = self._prompt_result or CFPromptResult(action="cancel_run")
-            self._prompt_event = None
-            self._prompt_result = None
-        return result
+        self.allow_water_mass_volume_override = allow_water_mass_volume_override
 
     @Slot()
     def run(self) -> None:
@@ -292,8 +189,55 @@ class PriorityWorker(QObject):
                 audit_tau=self.audit_tau,
                 strict_units=self.strict_units,
                 tolerance=self.tolerance,
-                cf_resolution_file=self.cf_resolution_file,
-                cf_prompt=self._prompt_cf,
+                allow_water_mass_volume_override=self.allow_water_mass_volume_override,
+                progress_callback=self.progress.emit,
+            )
+            self.finished.emit(result)
+        except Exception as exc:  # pragma: no cover - GUI guard
+            self.failed.emit(str(exc))
+        finally:
+            self.done.emit()
+
+
+class AmbiguityExplorerWorker(QObject):
+    progress = Signal(object)
+    finished = Signal(object)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(self, config: AmbiguityExploreConfig) -> None:
+        super().__init__()
+        self.config = config
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = explore_ambiguities(
+                self.config,
+                progress_callback=self.progress.emit,
+            )
+            self.finished.emit(result)
+        except Exception as exc:  # pragma: no cover - GUI guard
+            self.failed.emit(str(exc))
+        finally:
+            self.done.emit()
+
+
+class GreedyExactDiagnosticWorker(QObject):
+    progress = Signal(str, int, int)
+    finished = Signal(object)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(self, config: GreedyExactDiagnosticConfig) -> None:
+        super().__init__()
+        self.config = config
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = run_greedy_exact_diagnostic(
+                self.config,
                 progress_callback=self.progress.emit,
             )
             self.finished.emit(result)
@@ -339,6 +283,49 @@ class CurveMetadataWorker(QObject):
             self.done.emit()
 
 
+class AnimatedCard(QFrame):
+    def __init__(self, title: str, summary: str, content: QWidget, *, expanded: bool = False) -> None:
+        super().__init__()
+        self.setObjectName("guideCard")
+        self._title = title
+        self._content = content
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        self._toggle_button = QPushButton()
+        self._toggle_button.setObjectName("cardToggle")
+        self._toggle_button.setCheckable(True)
+        self._toggle_button.setChecked(expanded)
+        self._toggle_button.clicked.connect(self._toggle)
+        layout.addWidget(self._toggle_button)
+
+        summary_label = QLabel(summary)
+        summary_label.setObjectName("muted")
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
+
+        self._content.setMaximumHeight(self._content.sizeHint().height() if expanded else 0)
+        layout.addWidget(self._content)
+
+        self._animation = QPropertyAnimation(self._content, b"maximumHeight", self)
+        self._animation.setDuration(220)
+        self._animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._update_toggle_text()
+
+    def _toggle(self, checked: bool) -> None:
+        self._animation.stop()
+        self._animation.setStartValue(self._content.maximumHeight())
+        self._animation.setEndValue(self._content.sizeHint().height() if checked else 0)
+        self._animation.start()
+        self._update_toggle_text()
+
+    def _update_toggle_text(self) -> None:
+        prefix = "▾" if self._toggle_button.isChecked() else "▸"
+        self._toggle_button.setText(f"{prefix}  {self._title}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -347,7 +334,6 @@ class MainWindow(QMainWindow):
         self.database_edit = QLineEdit()
         self.methods_edit = QLineEdit()
         self.output_edit = QLineEdit()
-        self.cf_choices_edit = QLineEdit()
         self.tau_edit = QLineEdit("0.95")
         self.selection_edit = QLineEdit("all")
         self.policy_combo = QComboBox()
@@ -355,14 +341,75 @@ class MainWindow(QMainWindow):
         self.policy_combo.setCurrentText("drop")
         self.strict_units = QCheckBox("Enforce strict unit compatibility")
         self.strict_units.setChecked(True)
+        self.allow_water_mass_volume_override = QCheckBox(
+            "Allow water mass/volume override (1 kg = 0.001 m3)"
+        )
         self.priority_database_edit = QLineEdit()
         self.priority_methods_edit = QLineEdit()
         self.priority_output_edit = QLineEdit()
-        self.priority_cf_choices_edit = QLineEdit()
         self.priority_selection_edit = QLineEdit("all")
         self.priority_audit_tau_edit = QLineEdit("0.95, 0.99")
         self.priority_strict_units = QCheckBox("Enforce strict unit compatibility")
         self.priority_strict_units.setChecked(True)
+        self.priority_allow_water_mass_volume_override = QCheckBox(
+            "Allow water mass/volume override (1 kg = 0.001 m3)"
+        )
+        self.ambiguity_database_edit = QLineEdit()
+        self.ambiguity_methods_edit = QLineEdit()
+        self.ambiguity_output_edit = QLineEdit()
+        self.ambiguity_selection_edit = QLineEdit("all")
+        self.ambiguity_strict_units = QCheckBox("Enforce strict unit compatibility")
+        self.ambiguity_strict_units.setChecked(True)
+        self.ambiguity_allow_water_mass_volume_override = QCheckBox(
+            "Allow water mass/volume override (1 kg = 0.001 m3)"
+        )
+        self.ambiguity_tolerance_edit = QLineEdit("1e-12")
+        self.ecospold_ambiguity_database_edit = QLineEdit()
+        self.ecospold_ambiguity_methods_edit = QLineEdit()
+        self.ecospold_ambiguity_output_edit = QLineEdit()
+        self.ecospold_ambiguity_selection_edit = QLineEdit("all")
+        self.ecospold_ambiguity_strict_units = QCheckBox("Enforce strict unit compatibility")
+        self.ecospold_ambiguity_strict_units.setChecked(True)
+        self.ecospold_ambiguity_allow_water_mass_volume_override = QCheckBox(
+            "Allow water mass/volume override (1 kg = 0.001 m3)"
+        )
+        self.ecospold_ambiguity_tolerance_edit = QLineEdit("1e-12")
+        self.ecospold_database_edit = QLineEdit()
+        self.ecospold_methods_edit = QLineEdit()
+        self.ecospold_output_edit = QLineEdit()
+        self.ecospold_tau_edit = QLineEdit("0.95")
+        self.ecospold_selection_edit = QLineEdit("all")
+        self.ecospold_policy_combo = QComboBox()
+        self.ecospold_policy_combo.addItems(["keep", "drop", "fail"])
+        self.ecospold_policy_combo.setCurrentText("drop")
+        self.ecospold_strict_units = QCheckBox("Enforce strict unit compatibility")
+        self.ecospold_strict_units.setChecked(True)
+        self.ecospold_allow_water_mass_volume_override = QCheckBox(
+            "Allow water mass/volume override (1 kg = 0.001 m3)"
+        )
+        self.ecospold_priority_database_edit = QLineEdit()
+        self.ecospold_priority_methods_edit = QLineEdit()
+        self.ecospold_priority_output_edit = QLineEdit()
+        self.ecospold_priority_selection_edit = QLineEdit("all")
+        self.ecospold_priority_audit_tau_edit = QLineEdit("0.95, 0.99")
+        self.ecospold_priority_strict_units = QCheckBox("Enforce strict unit compatibility")
+        self.ecospold_priority_strict_units.setChecked(True)
+        self.ecospold_priority_allow_water_mass_volume_override = QCheckBox(
+            "Allow water mass/volume override (1 kg = 0.001 m3)"
+        )
+        method_selection_help = self._method_selection_help_text()
+        self.selection_edit.setToolTip(method_selection_help)
+        self.selection_edit.setWhatsThis(method_selection_help)
+        self.priority_selection_edit.setToolTip(method_selection_help)
+        self.priority_selection_edit.setWhatsThis(method_selection_help)
+        self.ambiguity_selection_edit.setToolTip(method_selection_help)
+        self.ambiguity_selection_edit.setWhatsThis(method_selection_help)
+        self.ecospold_ambiguity_selection_edit.setToolTip(method_selection_help)
+        self.ecospold_ambiguity_selection_edit.setWhatsThis(method_selection_help)
+        self.ecospold_selection_edit.setToolTip(method_selection_help)
+        self.ecospold_selection_edit.setWhatsThis(method_selection_help)
+        self.ecospold_priority_selection_edit.setToolTip(method_selection_help)
+        self.ecospold_priority_selection_edit.setWhatsThis(method_selection_help)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
@@ -372,6 +419,22 @@ class MainWindow(QMainWindow):
         self.priority_progress_bar.setRange(0, 1)
         self.priority_progress_bar.setValue(0)
         self.priority_progress_bar.setTextVisible(False)
+        self.ambiguity_progress_bar = QProgressBar()
+        self.ambiguity_progress_bar.setRange(0, 1)
+        self.ambiguity_progress_bar.setValue(0)
+        self.ambiguity_progress_bar.setTextVisible(False)
+        self.ecospold_ambiguity_progress_bar = QProgressBar()
+        self.ecospold_ambiguity_progress_bar.setRange(0, 1)
+        self.ecospold_ambiguity_progress_bar.setValue(0)
+        self.ecospold_ambiguity_progress_bar.setTextVisible(False)
+        self.ecospold_progress_bar = QProgressBar()
+        self.ecospold_progress_bar.setRange(0, 1)
+        self.ecospold_progress_bar.setValue(0)
+        self.ecospold_progress_bar.setTextVisible(False)
+        self.ecospold_priority_progress_bar = QProgressBar()
+        self.ecospold_priority_progress_bar.setRange(0, 1)
+        self.ecospold_priority_progress_bar.setValue(0)
+        self.ecospold_priority_progress_bar.setTextVisible(False)
 
         self.database_methods_label = QLabel("Select a database archive to check for embedded LCIA methods.")
         self.database_methods_label.setObjectName("muted")
@@ -379,6 +442,26 @@ class MainWindow(QMainWindow):
         self.priority_database_methods_label = QLabel("Select a database archive to check for embedded LCIA methods.")
         self.priority_database_methods_label.setObjectName("muted")
         self.priority_database_methods_label.setWordWrap(True)
+        self.ambiguity_database_methods_label = QLabel(
+            "Select a JSON-LD database archive to scan ambiguity records without reducing the database."
+        )
+        self.ambiguity_database_methods_label.setObjectName("muted")
+        self.ambiguity_database_methods_label.setWordWrap(True)
+        self.ecospold_ambiguity_database_methods_label = QLabel(
+            "Select an EcoSpold1 process archive or folder to scan ambiguity records without reducing the database."
+        )
+        self.ecospold_ambiguity_database_methods_label.setObjectName("muted")
+        self.ecospold_ambiguity_database_methods_label.setWordWrap(True)
+        self.ecospold_database_methods_label = QLabel(
+            "Select an EcoSpold1 process archive or folder. External impact-method input is optional."
+        )
+        self.ecospold_database_methods_label.setObjectName("muted")
+        self.ecospold_database_methods_label.setWordWrap(True)
+        self.ecospold_priority_database_methods_label = QLabel(
+            "Select an EcoSpold1 process archive or folder. External impact-method input is optional."
+        )
+        self.ecospold_priority_database_methods_label.setObjectName("muted")
+        self.ecospold_priority_database_methods_label.setWordWrap(True)
         self.status_box = QPlainTextEdit()
         self.status_box.setReadOnly(True)
         self.output_box = QPlainTextEdit()
@@ -389,6 +472,26 @@ class MainWindow(QMainWindow):
         self.priority_output_box = QPlainTextEdit()
         self.priority_output_box.setReadOnly(True)
         self.priority_output_box.setMaximumBlockCount(32)
+        self.ambiguity_status_box = QPlainTextEdit()
+        self.ambiguity_status_box.setReadOnly(True)
+        self.ambiguity_output_box = QPlainTextEdit()
+        self.ambiguity_output_box.setReadOnly(True)
+        self.ambiguity_output_box.setMaximumBlockCount(32)
+        self.ecospold_ambiguity_status_box = QPlainTextEdit()
+        self.ecospold_ambiguity_status_box.setReadOnly(True)
+        self.ecospold_ambiguity_output_box = QPlainTextEdit()
+        self.ecospold_ambiguity_output_box.setReadOnly(True)
+        self.ecospold_ambiguity_output_box.setMaximumBlockCount(32)
+        self.ecospold_status_box = QPlainTextEdit()
+        self.ecospold_status_box.setReadOnly(True)
+        self.ecospold_output_box = QPlainTextEdit()
+        self.ecospold_output_box.setReadOnly(True)
+        self.ecospold_output_box.setMaximumBlockCount(32)
+        self.ecospold_priority_status_box = QPlainTextEdit()
+        self.ecospold_priority_status_box.setReadOnly(True)
+        self.ecospold_priority_output_box = QPlainTextEdit()
+        self.ecospold_priority_output_box.setReadOnly(True)
+        self.ecospold_priority_output_box.setMaximumBlockCount(32)
 
         self.stage_value = QLabel("Idle")
         self.process_value = QLabel("0 / 0")
@@ -399,18 +502,112 @@ class MainWindow(QMainWindow):
         self.priority_process_value = QLabel("0 / 0")
         self.priority_current_process_value = QLabel("Ready")
         self.priority_current_process_value.setWordWrap(True)
+        self.ambiguity_stage_value = QLabel("Idle")
+        self.ambiguity_process_value = QLabel("0 / 0")
+        self.ambiguity_current_process_value = QLabel("Ready")
+        self.ambiguity_current_process_value.setWordWrap(True)
+        self.ecospold_ambiguity_stage_value = QLabel("Idle")
+        self.ecospold_ambiguity_process_value = QLabel("0 / 0")
+        self.ecospold_ambiguity_current_process_value = QLabel("Ready")
+        self.ecospold_ambiguity_current_process_value.setWordWrap(True)
+        self.ecospold_stage_value = QLabel("Idle")
+        self.ecospold_process_value = QLabel("0 / 0")
+        self.ecospold_exchange_value = QLabel("0 / 0")
+        self.ecospold_current_process_value = QLabel("Ready")
+        self.ecospold_current_process_value.setWordWrap(True)
+        self.ecospold_priority_stage_value = QLabel("Idle")
+        self.ecospold_priority_process_value = QLabel("0 / 0")
+        self.ecospold_priority_current_process_value = QLabel("Ready")
+        self.ecospold_priority_current_process_value.setWordWrap(True)
 
         self.inspect_button: QPushButton | None = None
         self.create_button: QPushButton | None = None
         self.priority_button: QPushButton | None = None
+        self.ambiguity_button: QPushButton | None = None
+        self.ecospold_ambiguity_button: QPushButton | None = None
+        self.ecospold_create_button: QPushButton | None = None
+        self.ecospold_priority_button: QPushButton | None = None
         self.use_database_methods_button: QPushButton | None = None
         self.priority_use_database_methods_button: QPushButton | None = None
+        self.ecospold_ambiguity_use_database_methods_button: QPushButton | None = None
+        self.selection_help_button = self._make_help_button(
+            "Show method-selection syntax and examples.",
+            self.show_method_selection_help,
+        )
+        self.priority_selection_help_button = self._make_help_button(
+            "Show method-selection syntax and examples.",
+            self.show_method_selection_help,
+        )
+        self.ambiguity_selection_help_button = self._make_help_button(
+            "Show method-selection syntax and examples.",
+            self.show_method_selection_help,
+        )
+        self.ecospold_selection_help_button = self._make_help_button(
+            "Show method-selection syntax and examples.",
+            self.show_method_selection_help,
+        )
+        self.ecospold_ambiguity_selection_help_button = self._make_help_button(
+            "Show method-selection syntax and examples.",
+            self.show_method_selection_help,
+        )
+        self.ecospold_priority_selection_help_button = self._make_help_button(
+            "Show method-selection syntax and examples.",
+            self.show_method_selection_help,
+        )
         self.database_has_impact_methods = False
         self.priority_database_has_impact_methods = False
+        self.ambiguity_database_has_impact_methods = False
+        self.ecospold_ambiguity_database_has_impact_methods = False
+        self.diagnostic_database_has_impact_methods = False
 
         self._reduction_thread: QThread | None = None
         self._reduction_worker: QObject | None = None
         self._reduction_mode = ""
+
+        self.diagnostic_database_edit = QLineEdit()
+        self.diagnostic_methods_edit = QLineEdit()
+        self.diagnostic_output_edit = QLineEdit()
+        self.diagnostic_selection_edit = QLineEdit("all")
+        self.diagnostic_tau_edit = QLineEdit("0.95")
+        self.diagnostic_process_edit = QLineEdit()
+        self.diagnostic_process_edit.setPlaceholderText("Exact process name or UUID")
+        self.diagnostic_sign_mode_combo = QComboBox()
+        self.diagnostic_sign_mode_combo.addItem("Both signs", "both")
+        self.diagnostic_sign_mode_combo.addItem("Positive only", "positive")
+        self.diagnostic_sign_mode_combo.addItem("Negative only", "negative")
+        self.diagnostic_strict_units = QCheckBox("Enforce strict unit compatibility")
+        self.diagnostic_strict_units.setChecked(True)
+        self.diagnostic_allow_water_mass_volume_override = QCheckBox(
+            "Allow water mass/volume override (1 kg = 0.001 m3)"
+        )
+        self.diagnostic_selection_help_button = self._make_help_button(
+            "Show method-selection syntax and examples.",
+            self.show_method_selection_help,
+        )
+        self.diagnostic_selection_edit.setToolTip(method_selection_help)
+        self.diagnostic_selection_edit.setWhatsThis(method_selection_help)
+        self.diagnostic_database_methods_label = QLabel("Select a database archive to check for embedded LCIA methods.")
+        self.diagnostic_database_methods_label.setObjectName("muted")
+        self.diagnostic_database_methods_label.setWordWrap(True)
+        self.diagnostic_run_button: QPushButton | None = None
+        self.diagnostic_use_database_methods_button: QPushButton | None = None
+        self.diagnostic_status_box = QPlainTextEdit()
+        self.diagnostic_status_box.setReadOnly(True)
+        self.diagnostic_output_box = QPlainTextEdit()
+        self.diagnostic_output_box.setReadOnly(True)
+        self.diagnostic_output_box.setMaximumBlockCount(32)
+        self.diagnostic_progress_bar = QProgressBar()
+        self.diagnostic_progress_bar.setRange(0, 1)
+        self.diagnostic_progress_bar.setValue(0)
+        self.diagnostic_progress_bar.setTextVisible(False)
+        self.diagnostic_stage_value = QLabel("Idle")
+        self.diagnostic_runtime_value = QLabel("-")
+        self.diagnostic_process_value = QLabel("Select a process")
+        self.diagnostic_process_value.setWordWrap(True)
+        self.diagnostic_protected_value = QLabel("-")
+        self.diagnostic_greedy_coverage_value = QLabel("-")
+        self.diagnostic_exact_coverage_value = QLabel("-")
+        self.diagnostic_certificate_value = QLabel("-")
 
         self.curve_group_name_edit = QLineEdit()
         self.curve_group_name_edit.setPlaceholderText("Database group name")
@@ -434,9 +631,27 @@ class MainWindow(QMainWindow):
         self._curve_active_run_id: str | None = None
         self._curve_queue: list[str] = []
         self._curve_removed_run_ids: set[str] = set()
+        self._hidden_tabs: list[QWidget] = []
+        self._priority_glad_tab_index: int | None = None
+        self._priority_glad_loaded = False
+        self._priority_analyser_tab_index: int | None = None
+        self._priority_analyser_loaded = False
+        self._tabs: QTabWidget | None = None
+
+        self.cli_profile_name_edit = QLineEdit("my_database")
+        self.cli_database_path_edit = QLineEdit()
+        self.cli_methods_path_edit = QLineEdit()
+        self.cli_output_path_edit = QLineEdit()
+        self.cli_priority_csv_path_edit = QLineEdit()
+        self.cli_metadata_json_path_edit = QLineEdit()
+        self.cli_command_boxes: dict[str, QPlainTextEdit] = {}
+        self.cli_note_labels: dict[str, QLabel] = {}
+        self.cli_copy_status_label: QLabel | None = None
 
         self._build()
         self._apply_style()
+        self._sync_cli_info_fields_from_forms()
+        self._refresh_cli_commands()
         self._refresh_curve_views()
 
     def _apply_style(self) -> None:
@@ -445,7 +660,7 @@ class MainWindow(QMainWindow):
             QWidget {
                 background: #f3f5f7;
                 color: #18222d;
-                font-family: "Avenir Next", "Helvetica Neue", "Segoe UI";
+                font-family: "Avenir Next", "Helvetica Neue", "Arial";
                 font-size: 13px;
             }
             QMainWindow {
@@ -454,6 +669,11 @@ class MainWindow(QMainWindow):
             QFrame#panel, QFrame#groupCard, QGroupBox {
                 background: #ffffff;
                 border: 1px solid #d3d9df;
+                border-radius: 10px;
+            }
+            QFrame#guideCard {
+                background: #ffffff;
+                border: 1px solid #cfd7df;
                 border-radius: 10px;
             }
             QGroupBox {
@@ -511,6 +731,15 @@ class MainWindow(QMainWindow):
                 background: #e8edf1;
                 color: #243341;
             }
+            QPushButton#cardToggle {
+                background: transparent;
+                color: #12202d;
+                border: 0;
+                padding: 0;
+                font-size: 16px;
+                font-weight: 700;
+                text-align: left;
+            }
             QPushButton#danger {
                 background: #8c3a2f;
                 color: #ffffff;
@@ -543,6 +772,12 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
                 padding: 8px;
             }
+            QLabel#eyebrow {
+                color: #315067;
+                font-size: 11px;
+                font-weight: 700;
+                text-transform: uppercase;
+            }
             QLabel#warningText {
                 color: #8a5200;
             }
@@ -568,6 +803,10 @@ class MainWindow(QMainWindow):
             QTableWidget {
                 gridline-color: #e3e8ee;
             }
+            QScrollArea#cliGuideScroll {
+                border: 0;
+                background: transparent;
+            }
             """
         )
 
@@ -591,6 +830,47 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(row)
         return container
+
+    def _make_help_button(self, tooltip: str, callback) -> QPushButton:
+        button = QPushButton("?")
+        button.setObjectName("secondary")
+        button.setFixedWidth(34)
+        button.setToolTip(tooltip)
+        button.clicked.connect(callback)
+        return button
+
+    def _method_selection_row(self, line_edit: QLineEdit, help_button: QPushButton) -> QWidget:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(line_edit, 1)
+        row.addWidget(help_button)
+        container = QWidget()
+        container.setLayout(row)
+        return container
+
+    @staticmethod
+    def _method_selection_help_text() -> str:
+        return (
+            "Accepted method-selection forms:\n"
+            "- all\n"
+            "- family:<text>\n"
+            "- method:<method name or uuid>\n"
+            "- category:<category name or uuid>\n\n"
+            "Examples:\n"
+            "- all\n"
+            "- family:ReCiPe\n"
+            "- method:IPCC 2021\n"
+            "- category:Climate change\n\n"
+            "Matching rules:\n"
+            "- family:<text> uses text matching.\n"
+            "- method:<text> and category:<text> first try an exact uuid, otherwise a name match.\n"
+            "- If a name matches multiple methods or categories, use the uuid instead.\n\n"
+            "Run Inspect first to list the available method and category names for the selected inputs."
+        )
+
+    def show_method_selection_help(self) -> None:
+        QMessageBox.information(self, "Method selection syntax", self._method_selection_help_text())
 
     def _make_stat_card(self, label: str, value_label: QLabel) -> QWidget:
         box = QFrame()
@@ -625,14 +905,99 @@ class MainWindow(QMainWindow):
         root.setSpacing(12)
 
         tabs = QTabWidget()
+        self._tabs = tabs
         tabs.addTab(self._build_reduction_tab(), "Reduction")
         tabs.addTab(self._build_priority_tab(), "Flow priority")
-        tabs.addTab(PriorityAnalyserPanel(), "Priority analyser")
+        self._hidden_tabs = [
+            self._build_ambiguity_tab(),
+            self._build_ecospold_ambiguity_tab(),
+            self._build_ecospold_reduction_tab(),
+            self._build_ecospold_priority_tab(),
+            self._build_greedy_exact_tab(),
+        ]
+        self._priority_glad_tab_index = tabs.addTab(self._build_priority_glad_placeholder(), "Priority -> GLAD")
+        self._priority_analyser_tab_index = tabs.addTab(self._build_priority_analyser_placeholder(), "Priority analyser")
         tabs.addTab(self._build_curves_tab(), "Reduction curves")
         tabs.addTab(self._build_cli_tab(), "CLI info")
+        tabs.currentChanged.connect(self._maybe_load_lazy_tabs)
         root.addWidget(tabs)
 
         self.setCentralWidget(central)
+
+    def _build_priority_analyser_placeholder(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("panel")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 14, 16, 14)
+        title = QLabel("Priority analyser loads on demand.")
+        title.setObjectName("sectionTitle")
+        body = QLabel(
+            "This tab is created lazily to keep GUI startup light. Open the tab to load the analyser and plots."
+        )
+        body.setWordWrap(True)
+        body.setObjectName("muted")
+        layout.addWidget(title)
+        layout.addWidget(body)
+        return frame
+
+    def _build_priority_glad_placeholder(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("panel")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 14, 16, 14)
+        title = QLabel("Priority -> GLAD loads on demand.")
+        title.setObjectName("sectionTitle")
+        body = QLabel(
+            "This tab is created lazily to keep GUI startup light. Open the tab to load direct target matching against bundled GLAD flow-list snapshots."
+        )
+        body.setWordWrap(True)
+        body.setObjectName("muted")
+        layout.addWidget(title)
+        layout.addWidget(body)
+        return frame
+
+    def _maybe_load_lazy_tabs(self, index: int) -> None:
+        if self._priority_glad_tab_index is not None and index == self._priority_glad_tab_index:
+            self._load_priority_glad_tab()
+        if self._priority_analyser_tab_index is not None and index == self._priority_analyser_tab_index:
+            self._load_priority_analyser_tab()
+
+    def _load_priority_glad_tab(self) -> None:
+        if self._priority_glad_loaded or self._tabs is None or self._priority_glad_tab_index is None:
+            return
+        from .priority_glad_gui import PriorityGladPanel
+
+        index = self._priority_glad_tab_index
+        placeholder = self._tabs.widget(index)
+        if placeholder is not None:
+            self._tabs.removeTab(index)
+            placeholder.deleteLater()
+        panel = PriorityGladPanel()
+        self._tabs.insertTab(index, panel, "Priority -> GLAD")
+        self._tabs.setCurrentIndex(index)
+        self._priority_glad_loaded = True
+
+    def _maybe_load_priority_analyser_tab(self, index: int) -> None:
+        if self._priority_analyser_loaded:
+            return
+        if self._priority_analyser_tab_index is None or index != self._priority_analyser_tab_index:
+            return
+        self._load_priority_analyser_tab()
+
+    def _load_priority_analyser_tab(self) -> None:
+        if self._priority_analyser_loaded or self._tabs is None or self._priority_analyser_tab_index is None:
+            return
+        from .priority_analyser_gui import PriorityAnalyserPanel
+
+        index = self._priority_analyser_tab_index
+        placeholder = self._tabs.widget(index)
+        if placeholder is not None:
+            self._tabs.removeTab(index)
+            placeholder.deleteLater()
+        panel = PriorityAnalyserPanel()
+        self._tabs.insertTab(index, panel, "Priority analyser")
+        self._tabs.setCurrentIndex(index)
+        self._priority_analyser_loaded = True
 
     def _build_reduction_tab(self) -> QWidget:
         tab = QWidget()
@@ -675,29 +1040,14 @@ class MainWindow(QMainWindow):
             self._picker_row(self.output_edit, "Browse", self.pick_output),
         )
 
-        load_cf_choices_button = QPushButton("Load choices")
-        load_cf_choices_button.setObjectName("secondary")
-        load_cf_choices_button.clicked.connect(self.pick_cf_choices_load)
-        save_cf_choices_button = QPushButton("Save choices")
-        save_cf_choices_button.setObjectName("secondary")
-        save_cf_choices_button.clicked.connect(self.pick_cf_choices_save)
-        inputs_form.addRow(
-            "CF choices CSV",
-            self._picker_row(
-                self.cf_choices_edit,
-                "Browse",
-                self.pick_cf_choices_load,
-                extra_buttons=[load_cf_choices_button, save_cf_choices_button],
-            ),
-        )
-
         settings_group = QGroupBox("Reduction settings")
         settings_form = QFormLayout(settings_group)
         settings_form.setSpacing(10)
         settings_form.addRow("Tau", self.tau_edit)
-        settings_form.addRow("Method selection", self.selection_edit)
+        settings_form.addRow("Method selection", self._method_selection_row(self.selection_edit, self.selection_help_button))
         settings_form.addRow("Uncharacterised policy", self.policy_combo)
         settings_form.addRow("", self.strict_units)
+        settings_form.addRow("", self.allow_water_mass_volume_override)
 
         top_row = QHBoxLayout()
         top_row.addWidget(inputs_group, 3)
@@ -852,21 +1202,17 @@ class MainWindow(QMainWindow):
             "Output folder",
             self._picker_row(self.priority_output_edit, "Browse", self.pick_priority_output),
         )
-        inputs_form.addRow(
-            "CF choices CSV",
-            self._picker_row(
-                self.priority_cf_choices_edit,
-                "Browse",
-                self.pick_priority_cf_choices_load,
-            ),
-        )
 
         settings_group = QGroupBox("Audit settings")
         settings_form = QFormLayout(settings_group)
         settings_form.setSpacing(10)
-        settings_form.addRow("Method selection", self.priority_selection_edit)
+        settings_form.addRow(
+            "Method selection",
+            self._method_selection_row(self.priority_selection_edit, self.priority_selection_help_button),
+        )
         settings_form.addRow("Audit tau values", self.priority_audit_tau_edit)
         settings_form.addRow("", self.priority_strict_units)
+        settings_form.addRow("", self.priority_allow_water_mass_volume_override)
 
         top_row = QHBoxLayout()
         top_row.addWidget(inputs_group, 3)
@@ -902,6 +1248,455 @@ class MainWindow(QMainWindow):
         root.addLayout(logs_row)
         return tab
 
+    def _build_ambiguity_tab(self) -> QWidget:
+        tab = QWidget()
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
+
+        root.addWidget(
+            self._make_section_header(
+                "Explore LCIA ambiguities from JSON-LD",
+                "Scan ambiguity records from a JSON-LD database without reducing it. This is the dedicated review workflow for non-location ambiguity.",
+            )
+        )
+
+        inputs_group = QGroupBox("Inputs")
+        inputs_form = QFormLayout(inputs_group)
+        inputs_form.setSpacing(10)
+        self.ambiguity_use_database_methods_button = QPushButton("Use database methods")
+        self.ambiguity_use_database_methods_button.setObjectName("secondary")
+        self.ambiguity_use_database_methods_button.clicked.connect(self.use_ambiguity_database_methods)
+        self.ambiguity_use_database_methods_button.setEnabled(False)
+        inputs_form.addRow(
+            "Database archive",
+            self._picker_row(self.ambiguity_database_edit, "Browse", self.pick_ambiguity_database),
+        )
+        inputs_form.addRow(
+            "Methods archive or folder",
+            self._picker_row(
+                self.ambiguity_methods_edit,
+                "Browse",
+                self.pick_ambiguity_methods,
+                extra_buttons=[self.ambiguity_use_database_methods_button],
+            ),
+        )
+        inputs_form.addRow("", self.ambiguity_database_methods_label)
+        inputs_form.addRow(
+            "Output folder",
+            self._picker_row(self.ambiguity_output_edit, "Browse", self.pick_ambiguity_output),
+        )
+
+        settings_group = QGroupBox("Scan settings")
+        settings_form = QFormLayout(settings_group)
+        settings_form.setSpacing(10)
+        settings_form.addRow(
+            "Method selection",
+            self._method_selection_row(self.ambiguity_selection_edit, self.ambiguity_selection_help_button),
+        )
+        settings_form.addRow("Tolerance", self.ambiguity_tolerance_edit)
+        settings_form.addRow("", self.ambiguity_strict_units)
+        settings_form.addRow("", self.ambiguity_allow_water_mass_volume_override)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(inputs_group, 3)
+        top_row.addWidget(settings_group, 2)
+        root.addLayout(top_row)
+
+        controls = QHBoxLayout()
+        self.ambiguity_button = QPushButton("Explore ambiguities")
+        self.ambiguity_button.clicked.connect(self.run_ambiguity_explorer)
+        controls.addWidget(self.ambiguity_button)
+        controls.addStretch(1)
+        root.addLayout(controls)
+
+        status_group = QGroupBox("Run status")
+        status_layout = QVBoxLayout(status_group)
+        stats_grid = QGridLayout()
+        stats_grid.addWidget(self._make_stat_card("Stage", self.ambiguity_stage_value), 0, 0)
+        stats_grid.addWidget(self._make_stat_card("Processes", self.ambiguity_process_value), 0, 1)
+        stats_grid.addWidget(self._make_stat_card("Current process", self.ambiguity_current_process_value), 1, 0, 1, 2)
+        status_layout.addLayout(stats_grid)
+        status_layout.addWidget(self.ambiguity_progress_bar)
+        root.addWidget(status_group)
+
+        logs_row = QHBoxLayout()
+        activity_group = QGroupBox("Run log")
+        activity_layout = QVBoxLayout(activity_group)
+        activity_layout.addWidget(self.ambiguity_status_box)
+        outputs_group = QGroupBox("Output artefacts")
+        outputs_layout = QVBoxLayout(outputs_group)
+        outputs_layout.addWidget(self.ambiguity_output_box)
+        logs_row.addWidget(activity_group, 1)
+        logs_row.addWidget(outputs_group, 1)
+        root.addLayout(logs_row)
+        return tab
+
+    def _build_ecospold_ambiguity_tab(self) -> QWidget:
+        tab = QWidget()
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
+
+        root.addWidget(
+            self._make_section_header(
+                "Explore LCIA ambiguities from EcoSpold1",
+                "Scan ambiguity records from an EcoSpold1 process archive or folder without reducing it. This uses the same ambiguity engine as the JSON-LD explorer.",
+            )
+        )
+
+        inputs_group = QGroupBox("Inputs")
+        inputs_form = QFormLayout(inputs_group)
+        inputs_form.setSpacing(10)
+        self.ecospold_ambiguity_use_database_methods_button = QPushButton("Use database methods")
+        self.ecospold_ambiguity_use_database_methods_button.setObjectName("secondary")
+        self.ecospold_ambiguity_use_database_methods_button.clicked.connect(self.use_ecospold_ambiguity_database_methods)
+        self.ecospold_ambiguity_use_database_methods_button.setEnabled(False)
+        inputs_form.addRow(
+            "Process archive or folder",
+            self._picker_row(self.ecospold_ambiguity_database_edit, "Browse", self.pick_ecospold_ambiguity_database),
+        )
+        inputs_form.addRow(
+            "Methods archive or folder",
+            self._picker_row(
+                self.ecospold_ambiguity_methods_edit,
+                "Browse",
+                self.pick_ecospold_ambiguity_methods,
+                extra_buttons=[self.ecospold_ambiguity_use_database_methods_button],
+            ),
+        )
+        inputs_form.addRow("", self.ecospold_ambiguity_database_methods_label)
+        inputs_form.addRow(
+            "Output folder",
+            self._picker_row(self.ecospold_ambiguity_output_edit, "Browse", self.pick_ecospold_ambiguity_output),
+        )
+
+        settings_group = QGroupBox("Scan settings")
+        settings_form = QFormLayout(settings_group)
+        settings_form.setSpacing(10)
+        settings_form.addRow(
+            "Method selection",
+            self._method_selection_row(
+                self.ecospold_ambiguity_selection_edit,
+                self.ecospold_ambiguity_selection_help_button,
+            ),
+        )
+        settings_form.addRow("Tolerance", self.ecospold_ambiguity_tolerance_edit)
+        settings_form.addRow("", self.ecospold_ambiguity_strict_units)
+        settings_form.addRow("", self.ecospold_ambiguity_allow_water_mass_volume_override)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(inputs_group, 3)
+        top_row.addWidget(settings_group, 2)
+        root.addLayout(top_row)
+
+        controls = QHBoxLayout()
+        self.ecospold_ambiguity_button = QPushButton("Explore ambiguities")
+        self.ecospold_ambiguity_button.clicked.connect(self.run_ecospold_ambiguity_explorer)
+        controls.addWidget(self.ecospold_ambiguity_button)
+        controls.addStretch(1)
+        root.addLayout(controls)
+
+        status_group = QGroupBox("Run status")
+        status_layout = QVBoxLayout(status_group)
+        stats_grid = QGridLayout()
+        stats_grid.addWidget(self._make_stat_card("Stage", self.ecospold_ambiguity_stage_value), 0, 0)
+        stats_grid.addWidget(self._make_stat_card("Processes", self.ecospold_ambiguity_process_value), 0, 1)
+        stats_grid.addWidget(
+            self._make_stat_card("Current process", self.ecospold_ambiguity_current_process_value),
+            1,
+            0,
+            1,
+            2,
+        )
+        status_layout.addLayout(stats_grid)
+        status_layout.addWidget(self.ecospold_ambiguity_progress_bar)
+        root.addWidget(status_group)
+
+        logs_row = QHBoxLayout()
+        activity_group = QGroupBox("Run log")
+        activity_layout = QVBoxLayout(activity_group)
+        activity_layout.addWidget(self.ecospold_ambiguity_status_box)
+        outputs_group = QGroupBox("Output artefacts")
+        outputs_layout = QVBoxLayout(outputs_group)
+        outputs_layout.addWidget(self.ecospold_ambiguity_output_box)
+        logs_row.addWidget(activity_group, 1)
+        logs_row.addWidget(outputs_group, 1)
+        root.addLayout(logs_row)
+        return tab
+
+    def _build_ecospold_reduction_tab(self) -> QWidget:
+        tab = QWidget()
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
+
+        root.addWidget(
+            self._make_section_header(
+                "EcoSpold1 reduction",
+                "Deterministic signed tau-cover on EcoSpold1 process archives using the same LCIA contribution and coverage rules as the JSON-LD reducer.",
+            )
+        )
+
+        inputs_group = QGroupBox("Inputs")
+        inputs_form = QFormLayout(inputs_group)
+        inputs_form.setSpacing(10)
+        inputs_form.addRow(
+            "Process archive or folder",
+            self._picker_row(self.ecospold_database_edit, "Browse", self.pick_ecospold_database),
+        )
+        inputs_form.addRow(
+            "Impact-method archive or folder",
+            self._picker_row(self.ecospold_methods_edit, "Browse", self.pick_ecospold_methods),
+        )
+        inputs_form.addRow("", self.ecospold_database_methods_label)
+        inputs_form.addRow(
+            "Output folder",
+            self._picker_row(self.ecospold_output_edit, "Browse", self.pick_ecospold_output),
+        )
+
+        settings_group = QGroupBox("Reduction settings")
+        settings_form = QFormLayout(settings_group)
+        settings_form.setSpacing(10)
+        settings_form.addRow("Tau", self.ecospold_tau_edit)
+        settings_form.addRow(
+            "Method selection",
+            self._method_selection_row(self.ecospold_selection_edit, self.ecospold_selection_help_button),
+        )
+        settings_form.addRow("Uncharacterised policy", self.ecospold_policy_combo)
+        settings_form.addRow("", self.ecospold_strict_units)
+        settings_form.addRow("", self.ecospold_allow_water_mass_volume_override)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(inputs_group, 3)
+        top_row.addWidget(settings_group, 2)
+        root.addLayout(top_row)
+
+        controls = QHBoxLayout()
+        self.ecospold_create_button = QPushButton("Create reduced EcoSpold archive")
+        self.ecospold_create_button.clicked.connect(self.run_ecospold_create)
+        controls.addWidget(self.ecospold_create_button)
+        controls.addStretch(1)
+        root.addLayout(controls)
+
+        status_group = QGroupBox("Run status")
+        status_layout = QVBoxLayout(status_group)
+        stats_grid = QGridLayout()
+        stats_grid.addWidget(self._make_stat_card("Stage", self.ecospold_stage_value), 0, 0)
+        stats_grid.addWidget(self._make_stat_card("Processes", self.ecospold_process_value), 0, 1)
+        stats_grid.addWidget(self._make_stat_card("Removed / seen", self.ecospold_exchange_value), 0, 2)
+        stats_grid.addWidget(self._make_stat_card("Current process", self.ecospold_current_process_value), 1, 0, 1, 3)
+        status_layout.addLayout(stats_grid)
+        status_layout.addWidget(self.ecospold_progress_bar)
+        root.addWidget(status_group)
+
+        logs_row = QHBoxLayout()
+        activity_group = QGroupBox("Run log")
+        activity_layout = QVBoxLayout(activity_group)
+        activity_layout.addWidget(self.ecospold_status_box)
+        outputs_group = QGroupBox("Output artefacts")
+        outputs_layout = QVBoxLayout(outputs_group)
+        outputs_layout.addWidget(self.ecospold_output_box)
+        logs_row.addWidget(activity_group, 1)
+        logs_row.addWidget(outputs_group, 1)
+        root.addLayout(logs_row)
+        return tab
+
+    def _build_ecospold_priority_tab(self) -> QWidget:
+        tab = QWidget()
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
+
+        root.addWidget(
+            self._make_section_header(
+                "EcoSpold1 flow priority",
+                "Generate LCIA-critical flow-priority sidecars from EcoSpold1 process archives without rewriting the source files.",
+            )
+        )
+
+        inputs_group = QGroupBox("Inputs")
+        inputs_form = QFormLayout(inputs_group)
+        inputs_form.setSpacing(10)
+        inputs_form.addRow(
+            "Process archive or folder",
+            self._picker_row(self.ecospold_priority_database_edit, "Browse", self.pick_ecospold_priority_database),
+        )
+        inputs_form.addRow(
+            "Impact-method archive or folder",
+            self._picker_row(self.ecospold_priority_methods_edit, "Browse", self.pick_ecospold_priority_methods),
+        )
+        inputs_form.addRow("", self.ecospold_priority_database_methods_label)
+        inputs_form.addRow(
+            "Output folder",
+            self._picker_row(self.ecospold_priority_output_edit, "Browse", self.pick_ecospold_priority_output),
+        )
+
+        settings_group = QGroupBox("Audit settings")
+        settings_form = QFormLayout(settings_group)
+        settings_form.setSpacing(10)
+        settings_form.addRow(
+            "Method selection",
+            self._method_selection_row(
+                self.ecospold_priority_selection_edit,
+                self.ecospold_priority_selection_help_button,
+            ),
+        )
+        settings_form.addRow("Audit tau values", self.ecospold_priority_audit_tau_edit)
+        settings_form.addRow("", self.ecospold_priority_strict_units)
+        settings_form.addRow("", self.ecospold_priority_allow_water_mass_volume_override)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(inputs_group, 3)
+        top_row.addWidget(settings_group, 2)
+        root.addLayout(top_row)
+
+        controls = QHBoxLayout()
+        self.ecospold_priority_button = QPushButton("Generate EcoSpold flow priority")
+        self.ecospold_priority_button.clicked.connect(self.run_ecospold_priority)
+        controls.addWidget(self.ecospold_priority_button)
+        controls.addStretch(1)
+        root.addLayout(controls)
+
+        status_group = QGroupBox("Run status")
+        status_layout = QVBoxLayout(status_group)
+        stats_grid = QGridLayout()
+        stats_grid.addWidget(self._make_stat_card("Stage", self.ecospold_priority_stage_value), 0, 0)
+        stats_grid.addWidget(self._make_stat_card("Processes", self.ecospold_priority_process_value), 0, 1)
+        stats_grid.addWidget(
+            self._make_stat_card("Current process", self.ecospold_priority_current_process_value),
+            1,
+            0,
+            1,
+            2,
+        )
+        status_layout.addLayout(stats_grid)
+        status_layout.addWidget(self.ecospold_priority_progress_bar)
+        root.addWidget(status_group)
+
+        logs_row = QHBoxLayout()
+        activity_group = QGroupBox("Run log")
+        activity_layout = QVBoxLayout(activity_group)
+        activity_layout.addWidget(self.ecospold_priority_status_box)
+        outputs_group = QGroupBox("Output artefacts")
+        outputs_layout = QVBoxLayout(outputs_group)
+        outputs_layout.addWidget(self.ecospold_priority_output_box)
+        logs_row.addWidget(activity_group, 1)
+        logs_row.addWidget(outputs_group, 1)
+        root.addLayout(logs_row)
+        return tab
+
+    def _build_greedy_exact_tab(self) -> QWidget:
+        tab = QWidget()
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(12)
+
+        root.addWidget(
+            self._make_section_header(
+                "Single-process greedy vs exact diagnostic",
+                "Compare the implemented greedy tau-cover against an exact single-process MILP, then write an importable JSON-LD diagnostic ZIP with cloned process variants.",
+            )
+        )
+
+        warning_box = QFrame()
+        warning_box.setObjectName("panel")
+        warning_layout = QVBoxLayout(warning_box)
+        warning_layout.setContentsMargins(16, 14, 16, 14)
+        warning_label = QLabel(diagnostic_warning_text())
+        warning_label.setObjectName("muted")
+        warning_label.setWordWrap(True)
+        warning_layout.addWidget(warning_label)
+        root.addWidget(warning_box)
+
+        inputs_group = QGroupBox("Inputs")
+        inputs_form = QFormLayout(inputs_group)
+        inputs_form.setSpacing(10)
+        self.diagnostic_use_database_methods_button = QPushButton("Use database methods")
+        self.diagnostic_use_database_methods_button.setObjectName("secondary")
+        self.diagnostic_use_database_methods_button.clicked.connect(self.use_diagnostic_database_methods)
+        self.diagnostic_use_database_methods_button.setEnabled(False)
+        inputs_form.addRow(
+            "Database archive",
+            self._picker_row(
+                self.diagnostic_database_edit,
+                "Browse",
+                self.pick_diagnostic_database,
+            ),
+        )
+        inputs_form.addRow(
+            "Methods archive or folder",
+            self._picker_row(
+                self.diagnostic_methods_edit,
+                "Browse",
+                self.pick_diagnostic_methods,
+                extra_buttons=[self.diagnostic_use_database_methods_button],
+            ),
+        )
+        inputs_form.addRow("", self.diagnostic_database_methods_label)
+        inputs_form.addRow(
+            "Output folder",
+            self._picker_row(self.diagnostic_output_edit, "Browse", self.pick_diagnostic_output),
+        )
+        inputs_form.addRow("Process", self.diagnostic_process_edit)
+        process_help = QLabel(
+            "Enter the exact process name or UUID. Leave empty to run the same diagnostic over all processes. "
+            "If the name is ambiguous, use the UUID."
+        )
+        process_help.setObjectName("muted")
+        process_help.setWordWrap(True)
+        inputs_form.addRow("", process_help)
+
+        settings_group = QGroupBox("Diagnostic settings")
+        settings_form = QFormLayout(settings_group)
+        settings_form.setSpacing(10)
+        settings_form.addRow(
+            "LCIA selection",
+            self._method_selection_row(self.diagnostic_selection_edit, self.diagnostic_selection_help_button),
+        )
+        settings_form.addRow("Tau values", self.diagnostic_tau_edit)
+        settings_form.addRow("Sign mode", self.diagnostic_sign_mode_combo)
+        settings_form.addRow("", self.diagnostic_strict_units)
+        settings_form.addRow("", self.diagnostic_allow_water_mass_volume_override)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(inputs_group, 3)
+        top_row.addWidget(settings_group, 2)
+        root.addLayout(top_row)
+
+        controls = QHBoxLayout()
+        self.diagnostic_run_button = QPushButton("Run diagnostic")
+        self.diagnostic_run_button.clicked.connect(self.run_greedy_exact_diagnostic)
+        controls.addWidget(self.diagnostic_run_button)
+        controls.addStretch(1)
+        root.addLayout(controls)
+
+        summary_group = QGroupBox("Run summary")
+        summary_layout = QVBoxLayout(summary_group)
+        stats_grid = QGridLayout()
+        stats_grid.addWidget(self._make_stat_card("Stage", self.diagnostic_stage_value), 0, 0)
+        stats_grid.addWidget(self._make_stat_card("Runtime", self.diagnostic_runtime_value), 0, 1)
+        stats_grid.addWidget(self._make_stat_card("Selected process", self.diagnostic_process_value), 0, 2)
+        stats_grid.addWidget(self._make_stat_card("Protected exchanges", self.diagnostic_protected_value), 1, 0)
+        stats_grid.addWidget(self._make_stat_card("Tau values", self.diagnostic_greedy_coverage_value), 1, 1)
+        stats_grid.addWidget(self._make_stat_card("Exact clones", self.diagnostic_exact_coverage_value), 1, 2)
+        stats_grid.addWidget(self._make_stat_card("Tau certificate", self.diagnostic_certificate_value), 2, 0, 1, 3)
+        summary_layout.addLayout(stats_grid)
+        summary_layout.addWidget(self.diagnostic_progress_bar)
+        root.addWidget(summary_group)
+
+        logs_row = QHBoxLayout()
+        activity_group = QGroupBox("Run log")
+        activity_layout = QVBoxLayout(activity_group)
+        activity_layout.addWidget(self.diagnostic_status_box)
+        outputs_group = QGroupBox("Output artefacts")
+        outputs_layout = QVBoxLayout(outputs_group)
+        outputs_layout.addWidget(self.diagnostic_output_box)
+        logs_row.addWidget(activity_group, 1)
+        logs_row.addWidget(outputs_group, 1)
+        root.addLayout(logs_row)
+        return tab
+
     def _build_cli_tab(self) -> QWidget:
         tab = QWidget()
         root = QVBoxLayout(tab)
@@ -911,72 +1706,280 @@ class MainWindow(QMainWindow):
         root.addWidget(
             self._make_section_header(
                 "CLI info",
-                "These are copy-ready commands for the same backend used by the GUI. Follow the workflow order below when you want reproducible scripted runs.",
+                "Copy-ready commands generated from the paths you choose here. The guide stays aligned with the real CLI behavior: `inspect` is read-only, `create` writes the lite ZIP run, `priority` writes sidecars only, and `analyse-priority` reads an existing compact priority CSV.",
             )
         )
 
-        intro = QFrame()
-        intro.setObjectName("panel")
-        intro_layout = QVBoxLayout(intro)
-        intro_layout.setContentsMargins(14, 12, 14, 12)
-        intro_title = QLabel("Recommended workflow")
-        intro_title.setObjectName("sectionTitle")
-        intro_title.setStyleSheet("font-size: 16px;")
-        intro_body = QLabel(
-            "1. Run `inspect` first.\n"
-            "2. Use `create` when you need a lite JSON-LD database ZIP.\n"
-            "3. Use `priority` when you need the LCIA-critical flow sidecars only.\n"
-            "4. Use `analyse-priority` to screen an already generated `lcia_flow_priority.csv`.\n"
-            "5. Use repeated `--select-flow-name` options when flow names contain commas."
-        )
-        intro_body.setObjectName("muted")
-        intro_body.setWordWrap(True)
-        intro_layout.addWidget(intro_title)
-        intro_layout.addWidget(intro_body)
-        root.addWidget(intro)
+        scroll = QScrollArea()
+        scroll.setObjectName("cliGuideScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
 
-        safety = QFrame()
-        safety.setObjectName("panel")
-        safety_layout = QVBoxLayout(safety)
-        safety_layout.setContentsMargins(14, 12, 14, 12)
-        safety_title = QLabel("Safety and output expectations")
-        safety_title.setObjectName("sectionTitle")
-        safety_title.setStyleSheet("font-size: 16px;")
-        safety_body = QLabel(
-            "The tool is ZIP-only. It does not use openLCA IPC, does not connect to openLCA, and does not edit a live openLCA database.\n"
-            "Only `create` writes a lite database ZIP. `priority` writes sidecars only. `analyse-priority` reads an existing CSV and does not rewrite the database."
+        container = QWidget()
+        content = QVBoxLayout(container)
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(12)
+        content.addWidget(self._build_cli_workspace_card())
+        content.addWidget(self._build_cli_summary_card())
+
+        for index, item in enumerate(CLI_GUIDE_SECTIONS):
+            content.addWidget(self._build_cli_command_card(item, expanded=index < 2))
+
+        content.addStretch(1)
+        scroll.setWidget(container)
+        root.addWidget(scroll, 1)
+        return tab
+
+    def _build_cli_workspace_card(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("panel")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+
+        eyebrow = QLabel("Live command preset")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("Build targeted commands")
+        title.setObjectName("sectionTitle")
+        body = QLabel(
+            "Fill in the paths once and the command cards below update immediately. These fields only shape the command examples; they do not start a run."
         )
-        safety_body.setObjectName("muted")
-        safety_body.setWordWrap(True)
-        safety_layout.addWidget(safety_title)
-        safety_layout.addWidget(safety_body)
-        root.addWidget(safety)
+        body.setObjectName("muted")
+        body.setWordWrap(True)
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+        layout.addWidget(body)
+
+        self.cli_profile_name_edit.setPlaceholderText("Friendly preset name")
+        self.cli_database_path_edit.setPlaceholderText("/path/to/original_database.zip")
+        self.cli_methods_path_edit.setPlaceholderText("/path/to/methods.zip or folder")
+        self.cli_output_path_edit.setPlaceholderText("/path/to/output_dir")
+        self.cli_priority_csv_path_edit.setPlaceholderText("/path/to/lcia_flow_priority.csv")
+        self.cli_metadata_json_path_edit.setPlaceholderText("/path/to/lcia_flow_priority_metadata.json")
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.addRow("Preset name", self.cli_profile_name_edit)
+        form.addRow("Database archive", self.cli_database_path_edit)
+        form.addRow("Methods archive or folder", self.cli_methods_path_edit)
+        form.addRow("Output folder", self.cli_output_path_edit)
+        form.addRow("Priority CSV", self.cli_priority_csv_path_edit)
+        form.addRow("Metadata JSON", self.cli_metadata_json_path_edit)
+        layout.addLayout(form)
+
+        actions = QHBoxLayout()
+        sync_reduction = QPushButton("Use reduction paths")
+        sync_reduction.setObjectName("secondary")
+        sync_reduction.clicked.connect(self._sync_cli_info_fields_from_forms)
+        sync_priority = QPushButton("Use priority paths")
+        sync_priority.setObjectName("secondary")
+        sync_priority.clicked.connect(self._sync_cli_info_priority_fields_from_forms)
+        copy_all = QPushButton("Copy all commands")
+        copy_all.setObjectName("secondary")
+        copy_all.clicked.connect(self.copy_all_cli_commands)
+        actions.addWidget(sync_reduction)
+        actions.addWidget(sync_priority)
+        actions.addWidget(copy_all)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.cli_copy_status_label = QLabel("Commands refresh as you type.")
+        self.cli_copy_status_label.setObjectName("muted")
+        self.cli_copy_status_label.setWordWrap(True)
+        layout.addWidget(self.cli_copy_status_label)
+
+        for line_edit in (
+            self.cli_profile_name_edit,
+            self.cli_database_path_edit,
+            self.cli_methods_path_edit,
+            self.cli_output_path_edit,
+            self.cli_priority_csv_path_edit,
+            self.cli_metadata_json_path_edit,
+        ):
+            line_edit.textChanged.connect(self._refresh_cli_commands)
+
+        return frame
+
+    def _build_cli_summary_card(self) -> QWidget:
+        frame = QFrame()
+        frame.setObjectName("panel")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("Recommended order")
+        title.setObjectName("sectionTitle")
+        title.setStyleSheet("font-size: 16px;")
+        body = QLabel(
+            "1. Run `inspect` first to confirm whether LCIA methods are already embedded.\n"
+            "2. Run `create` when you need the lite JSON-LD ZIP and validation artefacts.\n"
+            "3. Run `priority` when you need only LCIA-critical sidecars for transfer or mapping repair.\n"
+            "4. Run `analyse-priority` against an existing compact priority CSV.\n"
+            "5. Repeat `--select-flow-name` when a flow name contains commas."
+        )
+        body.setObjectName("muted")
+        body.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(body)
+        return frame
+
+    def _build_cli_command_card(self, item: dict[str, object], *, expanded: bool) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        command_box = QPlainTextEdit()
+        command_box.setReadOnly(True)
+        command_box.setLineWrapMode(QPlainTextEdit.NoWrap)
+        command_box.setMinimumHeight(132)
+        command_box.setMaximumHeight(172)
+
+        title = str(item["title"])
+        copy_button = QPushButton("Copy command")
+        copy_button.setObjectName("secondary")
+        copy_button.clicked.connect(lambda: self.copy_cli_command(title))
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.addWidget(copy_button)
+        button_row.addStretch(1)
+
+        notes = QLabel()
+        notes.setObjectName("muted")
+        notes.setWordWrap(True)
+
+        layout.addWidget(command_box)
+        layout.addLayout(button_row)
+        layout.addWidget(notes)
+
+        self.cli_command_boxes[title] = command_box
+        self.cli_note_labels[title] = notes
+        return AnimatedCard(title, str(item["summary"]), content, expanded=expanded)
+
+    def _sync_cli_info_fields_from_forms(self) -> None:
+        self.cli_database_path_edit.setText(self.database_edit.text().strip())
+        self.cli_methods_path_edit.setText(self.methods_edit.text().strip())
+        self.cli_output_path_edit.setText(self.output_edit.text().strip())
+        if self.cli_copy_status_label is not None:
+            self.cli_copy_status_label.setText("Loaded the current Reduction tab paths into the CLI guide.")
+
+    def _sync_cli_info_priority_fields_from_forms(self) -> None:
+        if self.priority_database_edit.text().strip():
+            self.cli_database_path_edit.setText(self.priority_database_edit.text().strip())
+        if self.priority_methods_edit.text().strip():
+            self.cli_methods_path_edit.setText(self.priority_methods_edit.text().strip())
+        if self.priority_output_edit.text().strip():
+            self.cli_output_path_edit.setText(self.priority_output_edit.text().strip())
+        if self.cli_copy_status_label is not None:
+            self.cli_copy_status_label.setText("Loaded the current Flow priority tab paths into the CLI guide.")
+
+    def _refresh_cli_commands(self) -> None:
+        profile_name = self.cli_profile_name_edit.text().strip() or "my_database"
+        database = self._shell_arg(self.cli_database_path_edit.text().strip(), "/path/to/original_database.zip")
+        methods_value = self.cli_methods_path_edit.text().strip()
+        methods_arg = (
+            f" \\\n  --methods {self._shell_arg(methods_value, '/path/to/methods.zip')}"
+            if methods_value
+            else ""
+        )
+        output_value = self.cli_output_path_edit.text().strip()
+        output_dir = self._shell_arg(output_value, "/path/to/output_dir")
+        derived_priority_csv = (
+            f"{output_value.rstrip('/')}/lcia_flow_priority.csv"
+            if output_value
+            else "/path/to/lcia_flow_priority.csv"
+        )
+        derived_metadata_json = (
+            f"{output_value.rstrip('/')}/lcia_flow_priority_metadata.json"
+            if output_value
+            else "/path/to/lcia_flow_priority_metadata.json"
+        )
+        priority_csv = self._shell_arg(
+            self.cli_priority_csv_path_edit.text().strip(),
+            derived_priority_csv,
+        )
+        metadata_json = self._shell_arg(
+            self.cli_metadata_json_path_edit.text().strip(),
+            derived_metadata_json,
+        )
+
+        commands = {
+            "1. Inspect Before You Run": (
+                f"# Inspect {profile_name} before any write operation\n"
+                "lci_reduce inspect \\\n"
+                f"  --database {database}{methods_arg}"
+            ),
+            "2. Create A Lite Database": (
+                f"# Create a reduced JSON-LD run for {profile_name}\n"
+                "lci_reduce create \\\n"
+                f"  --database {database}{methods_arg} \\\n"
+                f"  --output {output_dir} \\\n"
+                "  --tau 0.95 \\\n"
+                "  --method-selection all \\\n"
+                "  --uncharacterised-policy keep \\\n"
+                "  --strict-units true"
+            ),
+            "3. Generate LCIA Flow Priority Sidecars": (
+                f"# Generate LCIA-critical sidecars for {profile_name}\n"
+                "lci_reduce priority \\\n"
+                f"  --database {database}{methods_arg} \\\n"
+                f"  --output {output_dir} \\\n"
+                "  --method-selection all \\\n"
+                "  --audit-tau 0.95 0.99 \\\n"
+                "  --strict-units true"
+            ),
+            "4. Analyse An Existing Priority File": (
+                f"# Screen a compact priority CSV for {profile_name}\n"
+                "lci_reduce analyse-priority \\\n"
+                f"  --priority-csv {priority_csv} \\\n"
+                f"  --metadata-json {metadata_json} \\\n"
+                "  --audit-tau 0.95 \\\n"
+                "  --top-n 20 \\\n"
+                "  --select-flow-id flow-1 \\\n"
+                "  --select-flow-name 'Sulfur dioxide' \\\n"
+                "  --output-ranked-csv /path/to/ranked.csv \\\n"
+                "  --output-summary-json /path/to/priority_analysis_summary.json"
+            ),
+            "5. Start The Desktop GUI": "lci_reduce-gui",
+            "6. Alternate Entrypoints": (
+                f"python -m lci_reduce cli inspect --database {database}\n"
+                "python -m lci_reduce gui\n"
+                f"python main.py cli analyse-priority --priority-csv {priority_csv}\n"
+                "python main.py"
+            ),
+        }
 
         for item in CLI_GUIDE_SECTIONS:
-            card = QFrame()
-            card.setObjectName("panel")
-            layout = QVBoxLayout(card)
-            layout.setContentsMargins(14, 12, 14, 12)
-            title = QLabel(item["title"])
-            title.setObjectName("sectionTitle")
-            title.setStyleSheet("font-size: 16px;")
-            summary = QLabel(item["summary"])
-            summary.setObjectName("muted")
-            summary.setWordWrap(True)
-            command = QPlainTextEdit()
-            command.setReadOnly(True)
-            command.setPlainText(item["command"])
-            command.setMaximumHeight(140)
-            notes = QLabel("\n".join(f"- {note}" for note in item["notes"]))
-            notes.setObjectName("muted")
-            notes.setWordWrap(True)
-            layout.addWidget(title)
-            layout.addWidget(summary)
-            layout.addWidget(command)
-            layout.addWidget(notes)
-            root.addWidget(card)
-        root.addStretch(1)
-        return tab
+            title = str(item["title"])
+            if title in self.cli_command_boxes:
+                self.cli_command_boxes[title].setPlainText(commands.get(title, str(item["command"])))
+            if title in self.cli_note_labels:
+                self.cli_note_labels[title].setText("\n".join(f"- {note}" for note in item["notes"]))
+
+    @staticmethod
+    def _shell_arg(value: str, fallback: str) -> str:
+        return shlex.quote(value or fallback)
+
+    def copy_cli_command(self, title: str) -> None:
+        command_box = self.cli_command_boxes.get(title)
+        if command_box is None:
+            return
+        QApplication.clipboard().setText(command_box.toPlainText())
+        if self.cli_copy_status_label is not None:
+            self.cli_copy_status_label.setText(f"Copied the command for {title}.")
+
+    def copy_all_cli_commands(self) -> None:
+        blocks: list[str] = []
+        for item in CLI_GUIDE_SECTIONS:
+            title = str(item["title"])
+            command_box = self.cli_command_boxes.get(title)
+            if command_box is None:
+                continue
+            blocks.append(f"{title}\n{command_box.toPlainText()}")
+        QApplication.clipboard().setText("\n\n".join(blocks))
+        if self.cli_copy_status_label is not None:
+            self.cli_copy_status_label.setText("Copied all CLI guide commands.")
 
     def _make_chart_view(self) -> QChartView:
         chart = QChart()
@@ -993,11 +1996,41 @@ class MainWindow(QMainWindow):
     def append_priority_status(self, text: str) -> None:
         self.priority_status_box.appendPlainText(text)
 
+    def append_ambiguity_status(self, text: str) -> None:
+        self.ambiguity_status_box.appendPlainText(text)
+
+    def append_ecospold_ambiguity_status(self, text: str) -> None:
+        self.ecospold_ambiguity_status_box.appendPlainText(text)
+
+    def append_ecospold_status(self, text: str) -> None:
+        self.ecospold_status_box.appendPlainText(text)
+
+    def append_ecospold_priority_status(self, text: str) -> None:
+        self.ecospold_priority_status_box.appendPlainText(text)
+
+    def append_diagnostic_status(self, text: str) -> None:
+        self.diagnostic_status_box.appendPlainText(text)
+
     def set_output_paths(self, lines: list[str]) -> None:
         self.output_box.setPlainText("\n".join(line for line in lines if line))
 
     def set_priority_output_paths(self, lines: list[str]) -> None:
         self.priority_output_box.setPlainText("\n".join(line for line in lines if line))
+
+    def set_ambiguity_output_paths(self, lines: list[str]) -> None:
+        self.ambiguity_output_box.setPlainText("\n".join(line for line in lines if line))
+
+    def set_ecospold_ambiguity_output_paths(self, lines: list[str]) -> None:
+        self.ecospold_ambiguity_output_box.setPlainText("\n".join(line for line in lines if line))
+
+    def set_ecospold_output_paths(self, lines: list[str]) -> None:
+        self.ecospold_output_box.setPlainText("\n".join(line for line in lines if line))
+
+    def set_ecospold_priority_output_paths(self, lines: list[str]) -> None:
+        self.ecospold_priority_output_box.setPlainText("\n".join(line for line in lines if line))
+
+    def set_diagnostic_output_paths(self, lines: list[str]) -> None:
+        self.diagnostic_output_box.setPlainText("\n".join(line for line in lines if line))
 
     def reset_run_metrics(self) -> None:
         self.stage_value.setText("Idle")
@@ -1014,6 +2047,46 @@ class MainWindow(QMainWindow):
         self.priority_progress_bar.setRange(0, 1)
         self.priority_progress_bar.setValue(0)
 
+    def reset_ambiguity_metrics(self) -> None:
+        self.ambiguity_stage_value.setText("Idle")
+        self.ambiguity_process_value.setText("0 / 0")
+        self.ambiguity_current_process_value.setText("Ready")
+        self.ambiguity_progress_bar.setRange(0, 1)
+        self.ambiguity_progress_bar.setValue(0)
+
+    def reset_ecospold_ambiguity_metrics(self) -> None:
+        self.ecospold_ambiguity_stage_value.setText("Idle")
+        self.ecospold_ambiguity_process_value.setText("0 / 0")
+        self.ecospold_ambiguity_current_process_value.setText("Ready")
+        self.ecospold_ambiguity_progress_bar.setRange(0, 1)
+        self.ecospold_ambiguity_progress_bar.setValue(0)
+
+    def reset_ecospold_metrics(self) -> None:
+        self.ecospold_stage_value.setText("Idle")
+        self.ecospold_process_value.setText("0 / 0")
+        self.ecospold_exchange_value.setText("0 / 0")
+        self.ecospold_current_process_value.setText("Ready")
+        self.ecospold_progress_bar.setRange(0, 1)
+        self.ecospold_progress_bar.setValue(0)
+
+    def reset_ecospold_priority_metrics(self) -> None:
+        self.ecospold_priority_stage_value.setText("Idle")
+        self.ecospold_priority_process_value.setText("0 / 0")
+        self.ecospold_priority_current_process_value.setText("Ready")
+        self.ecospold_priority_progress_bar.setRange(0, 1)
+        self.ecospold_priority_progress_bar.setValue(0)
+
+    def reset_diagnostic_metrics(self) -> None:
+        self.diagnostic_stage_value.setText("Idle")
+        self.diagnostic_runtime_value.setText("-")
+        self.diagnostic_process_value.setText("Select a process")
+        self.diagnostic_protected_value.setText("-")
+        self.diagnostic_greedy_coverage_value.setText("-")
+        self.diagnostic_exact_coverage_value.setText("-")
+        self.diagnostic_certificate_value.setText("-")
+        self.diagnostic_progress_bar.setRange(0, 1)
+        self.diagnostic_progress_bar.setValue(0)
+
     def _set_run_controls_enabled(self, enabled: bool) -> None:
         if self.inspect_button is not None:
             self.inspect_button.setDisabled(not enabled)
@@ -1021,11 +2094,33 @@ class MainWindow(QMainWindow):
             self.create_button.setDisabled(not enabled)
         if self.priority_button is not None:
             self.priority_button.setDisabled(not enabled)
+        if self.ambiguity_button is not None:
+            self.ambiguity_button.setDisabled(not enabled)
+        if self.ecospold_ambiguity_button is not None:
+            self.ecospold_ambiguity_button.setDisabled(not enabled)
+        if self.ecospold_create_button is not None:
+            self.ecospold_create_button.setDisabled(not enabled)
+        if self.ecospold_priority_button is not None:
+            self.ecospold_priority_button.setDisabled(not enabled)
+        if self.diagnostic_run_button is not None:
+            self.diagnostic_run_button.setDisabled(not enabled)
         if self.use_database_methods_button is not None:
             self.use_database_methods_button.setDisabled((not enabled) or not self.database_has_impact_methods)
         if self.priority_use_database_methods_button is not None:
             self.priority_use_database_methods_button.setDisabled(
                 (not enabled) or not self.priority_database_has_impact_methods
+            )
+        if self.ambiguity_use_database_methods_button is not None:
+            self.ambiguity_use_database_methods_button.setDisabled(
+                (not enabled) or not self.ambiguity_database_has_impact_methods
+            )
+        if self.ecospold_ambiguity_use_database_methods_button is not None:
+            self.ecospold_ambiguity_use_database_methods_button.setDisabled(
+                (not enabled) or not self.ecospold_ambiguity_database_has_impact_methods
+            )
+        if self.diagnostic_use_database_methods_button is not None:
+            self.diagnostic_use_database_methods_button.setDisabled(
+                (not enabled) or not self.diagnostic_database_has_impact_methods
             )
 
     def set_busy(self, busy: bool, message: str) -> None:
@@ -1047,6 +2142,56 @@ class MainWindow(QMainWindow):
             self.priority_progress_bar.setRange(0, 1)
             self.priority_progress_bar.setValue(1)
         self.append_priority_status(message)
+
+    def set_ambiguity_busy(self, busy: bool, message: str) -> None:
+        self._set_run_controls_enabled(not busy)
+        if busy:
+            self.ambiguity_stage_value.setText("Running")
+            self.ambiguity_progress_bar.setRange(0, 0)
+        else:
+            self.ambiguity_progress_bar.setRange(0, 1)
+            self.ambiguity_progress_bar.setValue(1)
+        self.append_ambiguity_status(message)
+
+    def set_ecospold_ambiguity_busy(self, busy: bool, message: str) -> None:
+        self._set_run_controls_enabled(not busy)
+        if busy:
+            self.ecospold_ambiguity_stage_value.setText("Running")
+            self.ecospold_ambiguity_progress_bar.setRange(0, 0)
+        else:
+            self.ecospold_ambiguity_progress_bar.setRange(0, 1)
+            self.ecospold_ambiguity_progress_bar.setValue(1)
+        self.append_ecospold_ambiguity_status(message)
+
+    def set_ecospold_busy(self, busy: bool, message: str) -> None:
+        self._set_run_controls_enabled(not busy)
+        if busy:
+            self.ecospold_stage_value.setText("Running")
+            self.ecospold_progress_bar.setRange(0, 0)
+        else:
+            self.ecospold_progress_bar.setRange(0, 1)
+            self.ecospold_progress_bar.setValue(1)
+        self.append_ecospold_status(message)
+
+    def set_ecospold_priority_busy(self, busy: bool, message: str) -> None:
+        self._set_run_controls_enabled(not busy)
+        if busy:
+            self.ecospold_priority_stage_value.setText("Running")
+            self.ecospold_priority_progress_bar.setRange(0, 0)
+        else:
+            self.ecospold_priority_progress_bar.setRange(0, 1)
+            self.ecospold_priority_progress_bar.setValue(1)
+        self.append_ecospold_priority_status(message)
+
+    def set_diagnostic_busy(self, busy: bool, message: str) -> None:
+        self._set_run_controls_enabled(not busy)
+        if busy:
+            self.diagnostic_stage_value.setText("Running")
+            self.diagnostic_progress_bar.setRange(0, 0)
+        else:
+            self.diagnostic_progress_bar.setRange(0, 1)
+            self.diagnostic_progress_bar.setValue(1)
+        self.append_diagnostic_status(message)
 
     def _set_database_methods_hint(self, result: dict | None) -> None:
         if not result:
@@ -1097,6 +2242,104 @@ class MainWindow(QMainWindow):
             )
             if self.priority_use_database_methods_button is not None:
                 self.priority_use_database_methods_button.setEnabled(False)
+            return
+
+    def _set_ambiguity_database_methods_hint(self, result: dict | None) -> None:
+        if not result:
+            self.ambiguity_database_has_impact_methods = False
+            self.ambiguity_database_methods_label.setText(
+                "Select a database archive to scan ambiguity records without reducing the database."
+            )
+            if self.ambiguity_use_database_methods_button is not None:
+                self.ambiguity_use_database_methods_button.setEnabled(False)
+            return
+        if result.get("database_contains_impact_methods"):
+            self.ambiguity_database_has_impact_methods = True
+            self.ambiguity_database_methods_label.setText(
+                "The selected database already contains "
+                f"{result.get('database_lcia_methods', 0)} impact methods and "
+                f"{result.get('database_lcia_categories', 0)} impact categories."
+            )
+            if self.ambiguity_use_database_methods_button is not None and self._reduction_thread is None:
+                self.ambiguity_use_database_methods_button.setEnabled(True)
+        else:
+            self.ambiguity_database_has_impact_methods = False
+            self.ambiguity_database_methods_label.setText(
+                "No embedded impact methods were found. Provide an optional methods archive or folder if required."
+            )
+            if self.ambiguity_use_database_methods_button is not None:
+                self.ambiguity_use_database_methods_button.setEnabled(False)
+            return
+
+    def _set_ecospold_ambiguity_database_methods_hint(self, result: dict | None) -> None:
+        if not result:
+            self.ecospold_ambiguity_database_has_impact_methods = False
+            self.ecospold_ambiguity_database_methods_label.setText(
+                "Select an EcoSpold1 process archive or folder to scan ambiguity records without reducing the database."
+            )
+            if self.ecospold_ambiguity_use_database_methods_button is not None:
+                self.ecospold_ambiguity_use_database_methods_button.setEnabled(False)
+            return
+        if result.get("database_contains_impact_methods"):
+            self.ecospold_ambiguity_database_has_impact_methods = True
+            self.ecospold_ambiguity_database_methods_label.setText(
+                "The selected EcoSpold1 archive already contains "
+                f"{result.get('database_lcia_methods', 0)} impact methods and "
+                f"{result.get('database_lcia_categories', 0)} impact categories."
+            )
+            if self.ecospold_ambiguity_use_database_methods_button is not None and self._reduction_thread is None:
+                self.ecospold_ambiguity_use_database_methods_button.setEnabled(True)
+        else:
+            self.ecospold_ambiguity_database_has_impact_methods = False
+            self.ecospold_ambiguity_database_methods_label.setText(
+                "No embedded impact methods were found. Provide an optional methods archive or folder if required."
+            )
+            if self.ecospold_ambiguity_use_database_methods_button is not None:
+                self.ecospold_ambiguity_use_database_methods_button.setEnabled(False)
+            return
+
+    def _set_diagnostic_database_methods_hint(self, result: dict | None) -> None:
+        if not result:
+            self.diagnostic_database_has_impact_methods = False
+            self.diagnostic_database_methods_label.setText(
+                "Select a database archive to check for embedded LCIA methods."
+            )
+            if self.diagnostic_use_database_methods_button is not None:
+                self.diagnostic_use_database_methods_button.setEnabled(False)
+            return
+        if result.get("database_contains_impact_methods"):
+            self.diagnostic_database_has_impact_methods = True
+            self.diagnostic_database_methods_label.setText(
+                "The selected database already contains "
+                f"{result.get('database_lcia_methods', 0)} impact methods and "
+                f"{result.get('database_lcia_categories', 0)} impact categories."
+            )
+            if self.diagnostic_use_database_methods_button is not None and self._reduction_thread is None:
+                self.diagnostic_use_database_methods_button.setEnabled(True)
+        else:
+            self.diagnostic_database_has_impact_methods = False
+            self.diagnostic_database_methods_label.setText(
+                "No embedded impact methods were found. Provide an optional methods archive or folder if required."
+            )
+            if self.diagnostic_use_database_methods_button is not None:
+                self.diagnostic_use_database_methods_button.setEnabled(False)
+            return
+        if result.get("database_contains_impact_methods"):
+            self.priority_database_has_impact_methods = True
+            self.priority_database_methods_label.setText(
+                "The selected database already contains "
+                f"{result.get('database_lcia_methods', 0)} impact methods and "
+                f"{result.get('database_lcia_categories', 0)} impact categories."
+            )
+            if self.priority_use_database_methods_button is not None and self._reduction_thread is None:
+                self.priority_use_database_methods_button.setEnabled(True)
+        else:
+            self.priority_database_has_impact_methods = False
+            self.priority_database_methods_label.setText(
+                "No embedded impact methods were found. Provide an optional methods archive or folder if required."
+            )
+            if self.priority_use_database_methods_button is not None:
+                self.priority_use_database_methods_button.setEnabled(False)
 
     def pick_database(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1127,43 +2370,17 @@ class MainWindow(QMainWindow):
         if path:
             self.output_edit.setText(path)
 
-    def pick_cf_choices_load(self) -> None:
+    def _pick_folder_or_archive(self, folder_title: str, archive_title: str) -> str:
+        path = QFileDialog.getExistingDirectory(self, folder_title)
+        if path:
+            return path
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Load CF choices",
-            self.cf_choices_edit.text().strip(),
-            "CSV files (*.csv)",
+            archive_title,
+            "",
+            "Archive files (*.zip *.xml *.spold)",
         )
-        if path:
-            self.cf_choices_edit.setText(path)
-            self.append_status(f"Loaded CF choices file path: {path}")
-
-    def pick_cf_choices_save(self) -> None:
-        current_path = self.cf_choices_edit.text().strip()
-        output_dir = self.output_edit.text().strip()
-        default_path = current_path or str(Path(output_dir or ".") / "cf_resolution_choices.csv")
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save CF choices",
-            default_path,
-            "CSV files (*.csv)",
-        )
-        if not path:
-            return
-        destination = Path(path)
-        if current_path:
-            source = Path(current_path)
-            if source.exists() and source.resolve() != destination.resolve():
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(source.read_bytes())
-                self.append_status(f"Saved CF choices to {path}")
-            elif source.exists():
-                self.append_status(f"CF choices file already set to {path}")
-            else:
-                self.append_status(f"CF choices will be written to {path} on the next run.")
-        else:
-            self.append_status(f"CF choices will be written to {path} on the next run.")
-        self.cf_choices_edit.setText(path)
+        return path
 
     def pick_priority_database(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1194,16 +2411,110 @@ class MainWindow(QMainWindow):
         if path:
             self.priority_output_edit.setText(path)
 
-    def pick_priority_cf_choices_load(self) -> None:
+    def pick_ambiguity_database(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Load CF choices",
-            self.priority_cf_choices_edit.text().strip(),
-            "CSV files (*.csv)",
+            "Select database archive",
+            "",
+            "Archive files (*.zip *.zolca)",
         )
         if path:
-            self.priority_cf_choices_edit.setText(path)
-            self.append_priority_status(f"Loaded CF choices file path: {path}")
+            self.ambiguity_database_edit.setText(path)
+            if self._reduction_thread is None:
+                self.inspect_ambiguity_database_methods()
+
+    def pick_ambiguity_methods(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select methods folder")
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select methods archive",
+                "",
+                "Archive files (*.zip *.zolca)",
+            )
+        if path:
+            self.ambiguity_methods_edit.setText(path)
+
+    def pick_ambiguity_output(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select output folder")
+        if path:
+            self.ambiguity_output_edit.setText(path)
+
+    def pick_ecospold_ambiguity_database(self) -> None:
+        path = self._pick_folder_or_archive("Select EcoSpold1 process folder", "Select EcoSpold1 process archive")
+        if path:
+            self.ecospold_ambiguity_database_edit.setText(path)
+            if self._reduction_thread is None:
+                self.inspect_ecospold_ambiguity_database_methods()
+
+    def pick_ecospold_ambiguity_methods(self) -> None:
+        path = self._pick_folder_or_archive("Select EcoSpold1 impact-method folder", "Select EcoSpold1 impact-method archive")
+        if path:
+            self.ecospold_ambiguity_methods_edit.setText(path)
+
+    def pick_ecospold_ambiguity_output(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select output folder")
+        if path:
+            self.ecospold_ambiguity_output_edit.setText(path)
+
+    def pick_ecospold_database(self) -> None:
+        path = self._pick_folder_or_archive("Select EcoSpold1 process folder", "Select EcoSpold1 process archive")
+        if path:
+            self.ecospold_database_edit.setText(path)
+
+    def pick_ecospold_methods(self) -> None:
+        path = self._pick_folder_or_archive("Select EcoSpold1 impact-method folder", "Select EcoSpold1 impact-method archive")
+        if path:
+            self.ecospold_methods_edit.setText(path)
+
+    def pick_ecospold_output(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select output folder")
+        if path:
+            self.ecospold_output_edit.setText(path)
+
+    def pick_ecospold_priority_database(self) -> None:
+        path = self._pick_folder_or_archive("Select EcoSpold1 process folder", "Select EcoSpold1 process archive")
+        if path:
+            self.ecospold_priority_database_edit.setText(path)
+
+    def pick_ecospold_priority_methods(self) -> None:
+        path = self._pick_folder_or_archive("Select EcoSpold1 impact-method folder", "Select EcoSpold1 impact-method archive")
+        if path:
+            self.ecospold_priority_methods_edit.setText(path)
+
+    def pick_ecospold_priority_output(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select output folder")
+        if path:
+            self.ecospold_priority_output_edit.setText(path)
+
+    def pick_diagnostic_database(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select database archive",
+            "",
+            "Archive files (*.zip *.zolca)",
+        )
+        if path:
+            self.diagnostic_database_edit.setText(path)
+            if self._reduction_thread is None:
+                self.inspect_diagnostic_database_methods()
+
+    def pick_diagnostic_methods(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select methods folder")
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select methods archive",
+                "",
+                "Archive files (*.zip *.zolca)",
+            )
+        if path:
+            self.diagnostic_methods_edit.setText(path)
+
+    def pick_diagnostic_output(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select output folder")
+        if path:
+            self.diagnostic_output_edit.setText(path)
 
     def use_database_methods(self) -> None:
         self.methods_edit.clear()
@@ -1213,14 +2524,21 @@ class MainWindow(QMainWindow):
         self.priority_methods_edit.clear()
         self.append_priority_status("Using LCIA methods contained in the database. External methods input cleared.")
 
-    def prompt_cf_ambiguity(self, context: CFAmbiguityContext, candidates) -> CFPromptResult:
-        dialog = CFAmbiguityDialog(
-            self,
-            context,
-            [candidate_display_text(candidate) for candidate in candidates],
+    def use_ambiguity_database_methods(self) -> None:
+        self.ambiguity_methods_edit.clear()
+        self.append_ambiguity_status("Using LCIA methods contained in the database. External methods input cleared.")
+
+    def use_ecospold_ambiguity_database_methods(self) -> None:
+        self.ecospold_ambiguity_methods_edit.clear()
+        self.append_ecospold_ambiguity_status(
+            "Using LCIA methods contained in the database. External methods input cleared."
         )
-        dialog.exec()
-        return dialog.prompt_result
+
+    def use_diagnostic_database_methods(self) -> None:
+        self.diagnostic_methods_edit.clear()
+        self.append_diagnostic_status(
+            "Using LCIA methods contained in the database. External methods input cleared."
+        )
 
     def _start_reduction_worker(self, worker: QObject, *, mode: str) -> None:
         thread = QThread(self)
@@ -1261,6 +2579,38 @@ class MainWindow(QMainWindow):
             message = "Flow-priority audit finished."
             self.set_priority_busy(False, message)
             return
+        elif mode == "ambiguity_hint":
+            message = "Database method scan finished."
+            self.set_ambiguity_busy(False, message)
+            return
+        elif mode == "ambiguity":
+            message = "Ambiguity exploration finished."
+            self.set_ambiguity_busy(False, message)
+            return
+        elif mode == "ecospold_ambiguity_hint":
+            message = "EcoSpold1 database method scan finished."
+            self.set_ecospold_ambiguity_busy(False, message)
+            return
+        elif mode == "ecospold_ambiguity":
+            message = "EcoSpold1 ambiguity exploration finished."
+            self.set_ecospold_ambiguity_busy(False, message)
+            return
+        elif mode == "ecospold_create":
+            message = "EcoSpold reduction finished."
+            self.set_ecospold_busy(False, message)
+            return
+        elif mode == "ecospold_priority":
+            message = "EcoSpold flow-priority audit finished."
+            self.set_ecospold_priority_busy(False, message)
+            return
+        elif mode == "diagnostic_hint":
+            message = "Database method scan finished."
+            self.set_diagnostic_busy(False, message)
+            return
+        elif mode == "diagnostic":
+            message = "Greedy vs exact diagnostic finished."
+            self.set_diagnostic_busy(False, message)
+            return
         self.set_busy(False, message)
 
     def inspect_database_methods(self) -> None:
@@ -1283,6 +2633,36 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._handle_worker_failure)
         self._start_reduction_worker(worker, mode="priority_hint")
 
+    def inspect_ambiguity_database_methods(self) -> None:
+        database = self.ambiguity_database_edit.text().strip()
+        if not database or self._reduction_thread is not None:
+            return
+        self.set_ambiguity_busy(True, "Inspecting database methods...")
+        worker = InspectWorker(database, None)
+        worker.finished.connect(self._handle_ambiguity_database_method_hint)
+        worker.failed.connect(self._handle_worker_failure)
+        self._start_reduction_worker(worker, mode="ambiguity_hint")
+
+    def inspect_ecospold_ambiguity_database_methods(self) -> None:
+        database = self.ecospold_ambiguity_database_edit.text().strip()
+        if not database or self._reduction_thread is not None:
+            return
+        self.set_ecospold_ambiguity_busy(True, "Inspecting EcoSpold1 methods...")
+        worker = InspectWorker(database, None)
+        worker.finished.connect(self._handle_ecospold_ambiguity_database_method_hint)
+        worker.failed.connect(self._handle_worker_failure)
+        self._start_reduction_worker(worker, mode="ecospold_ambiguity_hint")
+
+    def inspect_diagnostic_database_methods(self) -> None:
+        database = self.diagnostic_database_edit.text().strip()
+        if not database or self._reduction_thread is not None:
+            return
+        self.set_diagnostic_busy(True, "Inspecting database methods...")
+        worker = InspectWorker(database, None)
+        worker.finished.connect(self._handle_diagnostic_database_method_hint)
+        worker.failed.connect(self._handle_worker_failure)
+        self._start_reduction_worker(worker, mode="diagnostic_hint")
+
     @Slot(object)
     def _handle_database_method_hint(self, result: object) -> None:
         data = result if isinstance(result, dict) else None
@@ -1297,11 +2677,42 @@ class MainWindow(QMainWindow):
         if data and data.get("database_methods_hint"):
             self.append_priority_status(data["database_methods_hint"])
 
+    @Slot(object)
+    def _handle_ambiguity_database_method_hint(self, result: object) -> None:
+        data = result if isinstance(result, dict) else None
+        self._set_ambiguity_database_methods_hint(data)
+        if data and data.get("database_methods_hint"):
+            self.append_ambiguity_status(data["database_methods_hint"])
+
+    @Slot(object)
+    def _handle_ecospold_ambiguity_database_method_hint(self, result: object) -> None:
+        data = result if isinstance(result, dict) else None
+        self._set_ecospold_ambiguity_database_methods_hint(data)
+        if data and data.get("database_methods_hint"):
+            self.append_ecospold_ambiguity_status(data["database_methods_hint"])
+
+    @Slot(object)
+    def _handle_diagnostic_database_method_hint(self, result: object) -> None:
+        data = result if isinstance(result, dict) else None
+        self._set_diagnostic_database_methods_hint(data)
+        if data and data.get("database_methods_hint"):
+            self.append_diagnostic_status(data["database_methods_hint"])
+
     @Slot(str)
     def _handle_worker_failure(self, message: str) -> None:
         QMessageBox.critical(self, "Run failed", message)
         if self._reduction_mode in {"priority", "priority_hint"}:
             self.append_priority_status(f"Run failed: {message}")
+        elif self._reduction_mode in {"ambiguity", "ambiguity_hint"}:
+            self.append_ambiguity_status(f"Run failed: {message}")
+        elif self._reduction_mode in {"ecospold_ambiguity", "ecospold_ambiguity_hint"}:
+            self.append_ecospold_ambiguity_status(f"Run failed: {message}")
+        elif self._reduction_mode == "ecospold_create":
+            self.append_ecospold_status(f"Run failed: {message}")
+        elif self._reduction_mode == "ecospold_priority":
+            self.append_ecospold_priority_status(f"Run failed: {message}")
+        elif self._reduction_mode in {"diagnostic", "diagnostic_hint"}:
+            self.append_diagnostic_status(f"Run failed: {message}")
         else:
             self.append_status(f"Run failed: {message}")
 
@@ -1343,6 +2754,81 @@ class MainWindow(QMainWindow):
 
         self.priority_current_process_value.setText(update.process_name or update.message)
         self.append_priority_status(update.message)
+
+    def update_ambiguity_progress(self, update: CreateProgressUpdate) -> None:
+        stage_total = max(update.stage_total or update.total or 1, 1)
+        stage_current = min(max(update.stage_current or update.current, 0), stage_total)
+        self.ambiguity_stage_value.setText(f"{stage_current} / {stage_total}")
+
+        if update.process_total:
+            current = min(max(update.process_current or 0, 0), update.process_total)
+            self.ambiguity_process_value.setText(f"{current} / {update.process_total}")
+            self.ambiguity_progress_bar.setRange(0, update.process_total)
+            self.ambiguity_progress_bar.setValue(current)
+        else:
+            self.ambiguity_process_value.setText("0 / 0")
+            self.ambiguity_progress_bar.setRange(0, stage_total)
+            self.ambiguity_progress_bar.setValue(stage_current)
+
+        self.ambiguity_current_process_value.setText(update.process_name or update.message)
+        self.append_ambiguity_status(update.message)
+
+    def update_ecospold_ambiguity_progress(self, update: CreateProgressUpdate) -> None:
+        stage_total = max(update.stage_total or update.total or 1, 1)
+        stage_current = min(max(update.stage_current or update.current, 0), stage_total)
+        self.ecospold_ambiguity_stage_value.setText(f"{stage_current} / {stage_total}")
+
+        if update.process_total:
+            current = min(max(update.process_current or 0, 0), update.process_total)
+            self.ecospold_ambiguity_process_value.setText(f"{current} / {update.process_total}")
+            self.ecospold_ambiguity_progress_bar.setRange(0, update.process_total)
+            self.ecospold_ambiguity_progress_bar.setValue(current)
+        else:
+            self.ecospold_ambiguity_process_value.setText("0 / 0")
+            self.ecospold_ambiguity_progress_bar.setRange(0, stage_total)
+            self.ecospold_ambiguity_progress_bar.setValue(stage_current)
+
+        self.ecospold_ambiguity_current_process_value.setText(update.process_name or update.message)
+        self.append_ecospold_ambiguity_status(update.message)
+
+    def update_ecospold_progress(self, update: CreateProgressUpdate) -> None:
+        stage_total = max(update.stage_total or update.total or 1, 1)
+        stage_current = min(max(update.stage_current or update.current, 0), stage_total)
+        self.ecospold_stage_value.setText(f"{stage_current} / {stage_total}")
+
+        if update.process_total:
+            current = min(max(update.process_current or 0, 0), update.process_total)
+            self.ecospold_process_value.setText(f"{current} / {update.process_total}")
+            self.ecospold_progress_bar.setRange(0, update.process_total)
+            self.ecospold_progress_bar.setValue(current)
+        else:
+            self.ecospold_process_value.setText("0 / 0")
+            self.ecospold_progress_bar.setRange(0, stage_total)
+            self.ecospold_progress_bar.setValue(stage_current)
+
+        removed = update.n_elementary_removed or 0
+        before = update.n_elementary_before or 0
+        self.ecospold_exchange_value.setText(f"{removed} / {before}")
+        self.ecospold_current_process_value.setText(update.process_name or update.message)
+        self.append_ecospold_status(update.message)
+
+    def update_ecospold_priority_progress(self, update: CreateProgressUpdate) -> None:
+        stage_total = max(update.stage_total or update.total or 1, 1)
+        stage_current = min(max(update.stage_current or update.current, 0), stage_total)
+        self.ecospold_priority_stage_value.setText(f"{stage_current} / {stage_total}")
+
+        if update.process_total:
+            current = min(max(update.process_current or 0, 0), update.process_total)
+            self.ecospold_priority_process_value.setText(f"{current} / {update.process_total}")
+            self.ecospold_priority_progress_bar.setRange(0, update.process_total)
+            self.ecospold_priority_progress_bar.setValue(current)
+        else:
+            self.ecospold_priority_process_value.setText("0 / 0")
+            self.ecospold_priority_progress_bar.setRange(0, stage_total)
+            self.ecospold_priority_progress_bar.setValue(stage_current)
+
+        self.ecospold_priority_current_process_value.setText(update.process_name or update.message)
+        self.append_ecospold_priority_status(update.message)
 
     def run_inspect(self) -> None:
         if self._reduction_thread is not None:
@@ -1395,13 +2881,52 @@ class MainWindow(QMainWindow):
             uncharacterised_policy=self.policy_combo.currentText(),
             strict_units=self.strict_units.isChecked(),
             tolerance=1e-12,
-            cf_resolution_file=self.cf_choices_edit.text().strip() or None,
+            allow_water_mass_volume_override=self.allow_water_mass_volume_override.isChecked(),
         )
         worker.progress.connect(self.update_create_progress)
-        worker.prompt_requested.connect(self._handle_cf_prompt_request)
         worker.finished.connect(self._handle_create_result)
         worker.failed.connect(self._handle_worker_failure)
         self._start_reduction_worker(worker, mode="create")
+
+    def run_ecospold_create(self) -> None:
+        if self._reduction_thread is not None:
+            return
+        database = self.ecospold_database_edit.text().strip()
+        output = self.ecospold_output_edit.text().strip()
+        if not database or not output:
+            QMessageBox.warning(
+                self,
+                "Missing input",
+                "Select an EcoSpold1 process archive or folder and an output folder.",
+            )
+            return
+
+        self.ecospold_status_box.clear()
+        self.ecospold_output_box.clear()
+        self.reset_ecospold_metrics()
+        self.set_ecospold_busy(True, "Creating reduced EcoSpold archive...")
+        try:
+            tau = float(self.ecospold_tau_edit.text())
+        except ValueError:
+            self.set_ecospold_busy(False, "EcoSpold reduction aborted.")
+            QMessageBox.warning(self, "Invalid tau", "Tau must be a numeric value in (0, 1].")
+            return
+
+        worker = CreateWorker(
+            database=database,
+            methods=self.ecospold_methods_edit.text().strip() or None,
+            output=output,
+            tau=tau,
+            method_selection=self.ecospold_selection_edit.text(),
+            uncharacterised_policy=self.ecospold_policy_combo.currentText(),
+            strict_units=self.ecospold_strict_units.isChecked(),
+            tolerance=1e-12,
+            allow_water_mass_volume_override=self.ecospold_allow_water_mass_volume_override.isChecked(),
+        )
+        worker.progress.connect(self.update_ecospold_progress)
+        worker.finished.connect(self._handle_ecospold_create_result)
+        worker.failed.connect(self._handle_worker_failure)
+        self._start_reduction_worker(worker, mode="ecospold_create")
 
     def _parse_audit_tau_values(self, value: str) -> list[float]:
         raw_text = value.replace("\n", " ").replace(",", " ")
@@ -1414,6 +2939,63 @@ class MainWindow(QMainWindow):
         if not result:
             raise ValueError("Provide at least one audit tau value.")
         return result
+
+    def _parse_diagnostic_tau_values(self, value: str) -> list[float]:
+        raw_text = value.replace("\n", " ").replace(",", " ")
+        tokens = [token.strip() for token in raw_text.split() if token.strip()]
+        if not tokens:
+            raise ValueError("Provide at least one tau value.")
+        return normalise_diagnostic_tau_values([float(token) for token in tokens])
+
+    def update_diagnostic_progress(self, message: str, current: int, total: int) -> None:
+        safe_total = max(total, 1)
+        safe_current = min(max(current, 0), safe_total)
+        self.diagnostic_stage_value.setText(f"{safe_current} / {safe_total}")
+        self.diagnostic_progress_bar.setRange(0, safe_total)
+        self.diagnostic_progress_bar.setValue(safe_current)
+        self.append_diagnostic_status(message)
+
+    def run_greedy_exact_diagnostic(self) -> None:
+        if self._reduction_thread is not None:
+            return
+        database = self.diagnostic_database_edit.text().strip()
+        output = self.diagnostic_output_edit.text().strip()
+        process_query = self.diagnostic_process_edit.text().strip()
+        if not database or not output:
+            QMessageBox.warning(
+                self,
+                "Missing input",
+                "Select a database archive and output folder before running the diagnostic.",
+            )
+            return
+        try:
+            tau_values = self._parse_diagnostic_tau_values(self.diagnostic_tau_edit.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid tau values", str(exc))
+            return
+
+        self.diagnostic_status_box.clear()
+        self.diagnostic_output_box.clear()
+        self.reset_diagnostic_metrics()
+        self.diagnostic_process_value.setText(process_query or "All processes")
+        self.set_diagnostic_busy(True, "Running greedy vs exact diagnostic...")
+        config = GreedyExactDiagnosticConfig(
+            database=database,
+            methods=self.diagnostic_methods_edit.text().strip() or None,
+            output_dir=output,
+            method_selection=self.diagnostic_selection_edit.text().strip() or "all",
+            process_query=process_query,
+            tau_values=tau_values,
+            sign_mode=str(self.diagnostic_sign_mode_combo.currentData()),
+            strict_units=self.diagnostic_strict_units.isChecked(),
+            tolerance=1e-12,
+            allow_water_mass_volume_override=self.diagnostic_allow_water_mass_volume_override.isChecked(),
+        )
+        worker = GreedyExactDiagnosticWorker(config)
+        worker.progress.connect(self.update_diagnostic_progress)
+        worker.finished.connect(self._handle_diagnostic_result)
+        worker.failed.connect(self._handle_worker_failure)
+        self._start_reduction_worker(worker, mode="diagnostic")
 
     def run_priority(self) -> None:
         if self._reduction_thread is not None:
@@ -1443,21 +3025,131 @@ class MainWindow(QMainWindow):
             audit_tau=audit_tau,
             strict_units=self.priority_strict_units.isChecked(),
             tolerance=1e-12,
-            cf_resolution_file=self.priority_cf_choices_edit.text().strip() or None,
+            allow_water_mass_volume_override=self.priority_allow_water_mass_volume_override.isChecked(),
         )
         worker.progress.connect(self.update_priority_progress)
-        worker.prompt_requested.connect(self._handle_cf_prompt_request)
         worker.finished.connect(self._handle_priority_result)
         worker.failed.connect(self._handle_worker_failure)
         self._start_reduction_worker(worker, mode="priority")
 
-    @Slot(object, object)
-    def _handle_cf_prompt_request(self, context: object, candidates: object) -> None:
-        worker = self._reduction_worker
-        if not isinstance(worker, (CreateWorker, PriorityWorker)):
+    def run_ambiguity_explorer(self) -> None:
+        if self._reduction_thread is not None:
             return
-        prompt_result = self.prompt_cf_ambiguity(context, candidates)
-        worker.deliver_prompt_result(prompt_result)
+        database = self.ambiguity_database_edit.text().strip()
+        output = self.ambiguity_output_edit.text().strip()
+        if not database or not output:
+            QMessageBox.warning(
+                self,
+                "Missing input",
+                "Select a database archive and an output folder.",
+            )
+            return
+
+        self.ambiguity_status_box.clear()
+        self.ambiguity_output_box.clear()
+        self.reset_ambiguity_metrics()
+        self.set_ambiguity_busy(True, "Exploring LCIA ambiguities...")
+        try:
+            tolerance = float(self.ambiguity_tolerance_edit.text())
+        except ValueError:
+            self.set_ambiguity_busy(False, "Ambiguity exploration aborted.")
+            QMessageBox.warning(self, "Invalid tolerance", "Tolerance must be a numeric value.")
+            return
+
+        worker = AmbiguityExplorerWorker(
+            AmbiguityExploreConfig(
+                database=database,
+                methods=self.ambiguity_methods_edit.text().strip() or None,
+                output_dir=output,
+                method_selection=self.ambiguity_selection_edit.text().strip() or "all",
+                strict_units=self.ambiguity_strict_units.isChecked(),
+                tolerance=tolerance,
+                allow_water_mass_volume_override=self.ambiguity_allow_water_mass_volume_override.isChecked(),
+            )
+        )
+        worker.progress.connect(self.update_ambiguity_progress)
+        worker.finished.connect(self._handle_ambiguity_result)
+        worker.failed.connect(self._handle_worker_failure)
+        self._start_reduction_worker(worker, mode="ambiguity")
+
+    def run_ecospold_ambiguity_explorer(self) -> None:
+        if self._reduction_thread is not None:
+            return
+        database = self.ecospold_ambiguity_database_edit.text().strip()
+        output = self.ecospold_ambiguity_output_edit.text().strip()
+        if not database or not output:
+            QMessageBox.warning(
+                self,
+                "Missing input",
+                "Select an EcoSpold1 process archive or folder and an output folder.",
+            )
+            return
+
+        self.ecospold_ambiguity_status_box.clear()
+        self.ecospold_ambiguity_output_box.clear()
+        self.reset_ecospold_ambiguity_metrics()
+        self.set_ecospold_ambiguity_busy(True, "Exploring EcoSpold1 LCIA ambiguities...")
+        try:
+            tolerance = float(self.ecospold_ambiguity_tolerance_edit.text())
+        except ValueError:
+            self.set_ecospold_ambiguity_busy(False, "EcoSpold1 ambiguity exploration aborted.")
+            QMessageBox.warning(self, "Invalid tolerance", "Tolerance must be a numeric value.")
+            return
+
+        worker = AmbiguityExplorerWorker(
+            AmbiguityExploreConfig(
+                database=database,
+                methods=self.ecospold_ambiguity_methods_edit.text().strip() or None,
+                output_dir=output,
+                method_selection=self.ecospold_ambiguity_selection_edit.text().strip() or "all",
+                strict_units=self.ecospold_ambiguity_strict_units.isChecked(),
+                tolerance=tolerance,
+                allow_water_mass_volume_override=self.ecospold_ambiguity_allow_water_mass_volume_override.isChecked(),
+            )
+        )
+        worker.progress.connect(self.update_ecospold_ambiguity_progress)
+        worker.finished.connect(self._handle_ecospold_ambiguity_result)
+        worker.failed.connect(self._handle_worker_failure)
+        self._start_reduction_worker(worker, mode="ecospold_ambiguity")
+
+    def run_ecospold_priority(self) -> None:
+        if self._reduction_thread is not None:
+            return
+        database = self.ecospold_priority_database_edit.text().strip()
+        output = self.ecospold_priority_output_edit.text().strip()
+        if not database or not output:
+            QMessageBox.warning(
+                self,
+                "Missing input",
+                "Select an EcoSpold1 process archive or folder and an output folder.",
+            )
+            return
+
+        self.ecospold_priority_status_box.clear()
+        self.ecospold_priority_output_box.clear()
+        self.reset_ecospold_priority_metrics()
+        self.set_ecospold_priority_busy(True, "Generating EcoSpold flow-priority files...")
+        try:
+            audit_tau = self._parse_audit_tau_values(self.ecospold_priority_audit_tau_edit.text())
+        except ValueError as exc:
+            self.set_ecospold_priority_busy(False, "EcoSpold flow-priority audit aborted.")
+            QMessageBox.warning(self, "Invalid audit tau values", str(exc))
+            return
+
+        worker = PriorityWorker(
+            database=database,
+            methods=self.ecospold_priority_methods_edit.text().strip() or None,
+            output=output,
+            method_selection=self.ecospold_priority_selection_edit.text(),
+            audit_tau=audit_tau,
+            strict_units=self.ecospold_priority_strict_units.isChecked(),
+            tolerance=1e-12,
+            allow_water_mass_volume_override=self.ecospold_priority_allow_water_mass_volume_override.isChecked(),
+        )
+        worker.progress.connect(self.update_ecospold_priority_progress)
+        worker.finished.connect(self._handle_ecospold_priority_result)
+        worker.failed.connect(self._handle_worker_failure)
+        self._start_reduction_worker(worker, mode="ecospold_priority")
 
     @Slot(object)
     def _handle_create_result(self, result: object) -> None:
@@ -1466,13 +3158,26 @@ class MainWindow(QMainWindow):
             output_text.extend(
                 [
                     result.output_zip,
-                    result.exchange_manifest_csv,
-                    result.process_manifest_csv,
                     result.run_summary_json,
+                    result.reduction_debug_ndjson,
                 ]
             )
             self.set_output_paths(output_text)
             self.append_status(json.dumps(result.summary, indent=2, ensure_ascii=True))
+
+    @Slot(object)
+    def _handle_ecospold_create_result(self, result: object) -> None:
+        output_text: list[str] = []
+        if hasattr(result, "output_zip"):
+            output_text.extend(
+                [
+                    result.output_zip,
+                    result.run_summary_json,
+                    result.reduction_debug_ndjson,
+                ]
+            )
+            self.set_ecospold_output_paths(output_text)
+            self.append_ecospold_status(json.dumps(result.summary, indent=2, ensure_ascii=True))
 
     @Slot(object)
     def _handle_priority_result(self, result: object) -> None:
@@ -1486,6 +3191,88 @@ class MainWindow(QMainWindow):
             )
             self.set_priority_output_paths(output_text)
             self.append_priority_status(json.dumps(result.metadata, indent=2, ensure_ascii=True))
+
+    @Slot(object)
+    def _handle_ambiguity_result(self, result: object) -> None:
+        output_text: list[str] = []
+        if hasattr(result, "cf_ambiguities_csv"):
+            output_text.extend(
+                [
+                    result.cf_ambiguities_csv,
+                    result.cf_ambiguity_metadata_json,
+                ]
+            )
+            self.set_ambiguity_output_paths(output_text)
+            self.append_ambiguity_status(json.dumps(result.metadata, indent=2, ensure_ascii=True))
+
+    @Slot(object)
+    def _handle_ecospold_ambiguity_result(self, result: object) -> None:
+        output_text: list[str] = []
+        if hasattr(result, "cf_ambiguities_csv"):
+            output_text.extend(
+                [
+                    result.cf_ambiguities_csv,
+                    result.cf_ambiguity_metadata_json,
+                ]
+            )
+            self.set_ecospold_ambiguity_output_paths(output_text)
+            self.append_ecospold_ambiguity_status(json.dumps(result.metadata, indent=2, ensure_ascii=True))
+
+    @Slot(object)
+    def _handle_ecospold_priority_result(self, result: object) -> None:
+        output_text: list[str] = []
+        if hasattr(result, "flow_priority_csv"):
+            output_text.extend(
+                [
+                    result.flow_priority_csv,
+                    result.flow_priority_metadata_json,
+                ]
+            )
+            self.set_ecospold_priority_output_paths(output_text)
+            self.append_ecospold_priority_status(json.dumps(result.metadata, indent=2, ensure_ascii=True))
+
+    @Slot(object)
+    def _handle_diagnostic_result(self, result: object) -> None:
+        if not hasattr(result, "metadata"):
+            return
+        metadata = result.metadata
+        summary = metadata.get("summary") or {}
+        selected_process = metadata.get("selected_process") or {}
+        if metadata.get("batch_mode"):
+            self.diagnostic_process_value.setText(f"All processes ({summary.get('n_processes', 0)})")
+            self.diagnostic_protected_value.setText("-")
+        else:
+            self.diagnostic_process_value.setText(
+                f"{selected_process['process_name']} [{selected_process['process_id']}]"
+            )
+            self.diagnostic_protected_value.setText(str(selected_process["protected_exchanges"]))
+        self.diagnostic_greedy_coverage_value.setText(summary.get("tau_values_text", "-"))
+        self.diagnostic_exact_coverage_value.setText(
+            (
+                f"{summary.get('n_exact_clones_written', 0)} / {summary.get('n_tau_values', 0)}"
+                if not metadata.get("batch_mode")
+                else str(sum(int(item.get("exact_solved_processes", 0)) for item in metadata.get("aggregate_by_tau") or []))
+            )
+        )
+        greedy_ok = bool(summary.get("all_greedy_certificates_pass"))
+        exact_optimal = bool(summary.get("all_exact_tau_optimal"))
+        exact_valid = bool(summary.get("all_exact_results_valid"))
+        self.diagnostic_certificate_value.setText(
+            f"greedy={'pass' if greedy_ok else 'fail'} | exact_valid={'yes' if exact_valid else 'no'} | exact_all_tau={'yes' if exact_optimal else 'no'}"
+        )
+        tau_results = metadata.get("tau_results") or []
+        if not tau_results and metadata.get("process_results"):
+            tau_results = [
+                tau_row
+                for process_row in metadata.get("process_results") or []
+                for tau_row in process_row.get("tau_results") or []
+            ]
+        runtime_total = sum(float(row.get("runtime_seconds") or 0.0) for row in tau_results)
+        self.diagnostic_runtime_value.setText(f"{runtime_total:.3f}s")
+        self.set_diagnostic_output_paths(
+            [path for path in [result.diagnostic_zip, result.metadata_json, result.summary_csv, result.debug_csv] if path]
+        )
+        self.append_diagnostic_status(json.dumps(metadata, indent=2, ensure_ascii=True))
 
     def _curve_cache_key(self, source_path: str) -> str:
         path = Path(source_path)
